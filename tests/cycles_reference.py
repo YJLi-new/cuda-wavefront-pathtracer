@@ -1,12 +1,14 @@
 # cycles_reference.py - renders a pt scene (OBJ + materials.json + camera.json + lighting.json) with Blender Cycles,
 # mapping every parameter item by item, and writes linear radiance as PFM.
-#   blender -b -P cycles_reference.py -- SCENE_DIR OUT_PREFIX [--spp 1024] [--bounces 8] [--device OPTIX] [--envcheck 1]
+#   blender -b -P cycles_reference.py -- SCENE_DIR OUT_PREFIX [--spp 1024] [--bounces 8] [--device OPTIX] [--envcheck 1] [--time 1]
+# --time 1: persistent data on, the scene is rendered twice and both renders are timed with a wall clock around
+#           bpy.ops.render.render (the second render, with the BVH and kernels reused, is the timing we report).
 # Mapping: Principled BSDF (multiscatter off: distribution GGX), base_color -> Base Color, metallic -> Metallic,
 # roughness -> Roughness, ior -> IOR, specular_weight w -> Specular IOR Level 0.5*w (0 disables, 0.5 = plain IOR),
 # specular_color -> Specular Tint (F82 tint for metals), transmission -> Transmission Weight,
 # emission_color/strength -> Emission Color/Strength. World: Environment Texture (Closest interpolation) x strength.
 # Russian roulette off (min_light_bounces = bounces), no clamping, 1 px box filter, no denoising/adaptive sampling.
-import bpy, sys, json, math, os
+import bpy, sys, json, math, os, time
 import numpy as np
 
 argv = sys.argv[sys.argv.index("--") + 1:]
@@ -84,7 +86,14 @@ cy.device = "GPU"
 print("devices", [d.name for d in prefs.devices if d.use])
 sc.render.image_settings.file_format = "OPEN_EXR"; sc.render.image_settings.color_depth = "32"
 sc.render.filepath = OUT + ".exr"
-bpy.ops.render.render(write_still=True)
+if opt.get("--time", "0") == "1":
+    sc.render.use_persistent_data = True; ts = []
+    for _ in range(2):
+        t0 = time.perf_counter(); bpy.ops.render.render(write_still=False); ts.append(time.perf_counter() - t0)
+    bpy.data.images["Render Result"].save_render(sc.render.filepath)
+    print("cycles_time_s render1 %.4f render2 %.4f" % (ts[0], ts[1]))
+else:
+    bpy.ops.render.render(write_still=True)
 
 def load_rgb(path):
     im = bpy.data.images.load(path); a = np.array(im.pixels[:], dtype=np.float32).reshape(im.size[1], im.size[0], 4)[::-1, :, :3]

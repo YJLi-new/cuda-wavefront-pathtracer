@@ -1,13 +1,15 @@
 # cycles_gltf_reference.py - Blender Cycles reference for a glTF model under an HDRI (run with Blender's Python / bpy).
 #   python cycles_gltf_reference.py -- MODEL.gltf OUTDIR --hdri ENV.hdr [--spp 1024] [--bounces 8] [--width 512]
-#          [--height 512] [--hfov 40] [--az -60] [--el 20] [--device OPTIX]
+#          [--height 512] [--hfov 40] [--az -60] [--el 20] [--device OPTIX] [--time 1]
+# --time 1: persistent data on, the main render is done twice and both are timed with a wall clock around
+#           bpy.ops.render.render (the second render is the timing we report); the coverage render is not timed.
 # Imports the model with Blender's glTF importer, frames it automatically (bounding sphere of all mesh vertices, camera
 # at azimuth/elevation looking at its centre) and writes OUTDIR/{camera.json, lighting.json} for pt, then renders
 #   OUTDIR/cycles.pfm    linear radiance, settings as tests/cycles_reference.py: every Principled BSDF set to GGX
 #                        (multiscatter off), world = Environment Texture (Closest) strength 1, RR off, no clamping,
 #                        1 px box filter, no denoising / adaptive sampling
 #   OUTDIR/coverage.pfm  per-pixel object coverage (all materials replaced by white emission, black world, 64 spp)
-import bpy, sys, json, math, os
+import bpy, sys, json, math, os, time
 import numpy as np
 import addon_utils
 
@@ -89,9 +91,16 @@ cy.device = "GPU"
 print("devices", [d.name for d in prefs.devices if d.use])
 sc.render.image_settings.file_format = "OPEN_EXR"; sc.render.image_settings.color_depth = "32"
 
-def render_pfm(name):
+def render_pfm(name, timed=False):
     sc.render.filepath = os.path.join(OD, name + ".exr")
-    bpy.ops.render.render(write_still=True)
+    if timed:
+        sc.render.use_persistent_data = True; ts = []
+        for _ in range(2):
+            t0 = time.perf_counter(); bpy.ops.render.render(write_still=False); ts.append(time.perf_counter() - t0)
+        bpy.data.images["Render Result"].save_render(sc.render.filepath)
+        print("cycles_time_s render1 %.4f render2 %.4f" % (ts[0], ts[1]))
+    else:
+        bpy.ops.render.render(write_still=True)
     im = bpy.data.images.load(sc.render.filepath)
     a = np.array(im.pixels[:], dtype=np.float32).reshape(im.size[1], im.size[0], 4)[::-1, :, :3]   # row 0 = top
     with open(os.path.join(OD, name + ".pfm"), "wb") as f:
@@ -99,7 +108,8 @@ def render_pfm(name):
     os.remove(sc.render.filepath)
     print("wrote", name + ".pfm", "mean", a.reshape(-1, 3).mean(0))
 
-render_pfm("cycles")
+render_pfm("cycles", timed=opt.get("--time", "0") == "1")
+sc.render.use_persistent_data = False
 
 # ---- coverage: white emission everywhere, black world, camera rays only ----
 em = bpy.data.materials.new("cov"); em.use_nodes = True; ent = em.node_tree
