@@ -73,16 +73,17 @@ So the question was how much a specialized kernel can extract from the CUDA core
 ## How it works
 
 ```mermaid
-flowchart LR
-    A["k_raygen<br/>W × H × K camera rays<br/>(K samples per pixel in flight)"] --> B
-    subgraph L ["per bounce · repeated until the queue is empty or the bounce limit is reached"]
-        B["k_trace_shade (fused)<br/>BVH2 traversal → closest hit<br/>Lambert shading, next-event estimation"] -->|"atomic append"| C[("continuation<br/>queue")]
-        B -->|"atomic append"| D[("shadow-ray<br/>queue")]
-        D --> E["k_shadow<br/>any-hit traversal<br/>adds sun contribution if unoccluded"]
-        C -->|"swap queues"| B
+flowchart TD
+    A["<b>k_raygen</b><br/>W × H × K camera rays"] --> B
+    subgraph L ["each bounce, until the queue is empty"]
+        B["<b>k_trace_shade</b> (fused)<br/>BVH2 traversal → closest hit<br/>Lambert shading + sun sampling"]
+        B -->|"continuation rays"| C[("path queue")]
+        B -->|"shadow rays"| D[("shadow queue")]
+        D --> E["<b>k_shadow</b><br/>any-hit traversal"]
+        C -->|"next bounce"| B
     end
-    B -.->|"miss: add sky × throughput"| F[("accumulation<br/>buffer")]
-    E --> F
+    B -.->|"miss: sky × throughput"| F[("accumulation buffer")]
+    E -->|"unoccluded: sun × throughput"| F
     F --> G["PNG (sRGB) + PFM (linear)"]
 ```
 

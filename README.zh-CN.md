@@ -72,16 +72,17 @@ A100、H100、H800 这类数据中心 GPU 没有 RT 核心，OptiX 在这些卡�
 ## 工作原理
 
 ```mermaid
-flowchart LR
-    A["k_raygen<br/>W × H × K 条相机光线<br/>（每像素 K 个样本同时在飞）"] --> B
-    subgraph L ["逐次反弹 · 直到队列为空或达到反弹上限"]
-        B["k_trace_shade（融合）<br/>BVH2 遍历 → 最近命中<br/>Lambert 着色、下一事件估计"] -->|"原子追加"| C[("续射线<br/>队列")]
-        B -->|"原子追加"| D[("阴影光线<br/>队列")]
-        D --> E["k_shadow<br/>any-hit 遍历<br/>未被遮挡则累加太阳贡献"]
-        C -->|"交换队列"| B
+flowchart TD
+    A["<b>k_raygen</b><br/>W × H × K 条相机光线"] --> B
+    subgraph L ["逐次反弹，直到队列为空"]
+        B["<b>k_trace_shade</b>（融合）<br/>BVH2 遍历 → 最近命中<br/>Lambert 着色 + 太阳采样"]
+        B -->|"续射线"| C[("路径队列")]
+        B -->|"阴影光线"| D[("阴影队列")]
+        D --> E["<b>k_shadow</b><br/>any-hit 遍历"]
+        C -->|"下一次反弹"| B
     end
-    B -.->|"未命中：累加 天空 × 通量"| F[("累加<br/>缓冲")]
-    E --> F
+    B -.->|"未命中：天空 × 通量"| F[("累加缓冲")]
+    E -->|"未遮挡：太阳 × 通量"| F
     F --> G["PNG（sRGB）+ PFM（线性）"]
 ```
 
