@@ -73,14 +73,14 @@ A100、H100、H800 这类数据中心 GPU 没有 RT 核心，OptiX 在这些卡�
 | 2,804,474 三角形 | 512×512 | **30.1 ms** · 6,086 Mrays/s | 232 ms · ≈787 Mrays/s | 250 ms | **7.7×** | 50.85 dB |
 | 2,804,474 三角形 | 1280×720 | **137.2 ms** · 5,407 Mrays/s | 1,048 ms · ≈708 Mrays/s | 1,115 ms | **7.6×** | 49.93 dB |
 
-**用本版本重测**：同型号的卡、同一场景、同一配置，换成本版本的二进制。
+**用本版本重测**：同型号的卡、同一场景、同一配置，换成本版本的二进制（2026-10-17 计时）。四行吞吐与发布值相差 −0.1% 到 +2.3%，对 Cycles 的图像一致性与之前相同。
 
 | 场景 | 分辨率 | 本版本 | 相对发布值 Mrays/s | 对 Cycles 的 PSNR |
 |---|---|---|---|---|
-| 116,855 三角形 | 512×512 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 116,855 三角形 | 1280×720 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 2,804,474 三角形 | 512×512 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 2,804,474 三角形 | 1280×720 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
+| 116,855 三角形 | 512×512 | **21.0 ms** · 8,704 Mrays/s | 1.023× | 50.86 dB |
+| 116,855 三角形 | 1280×720 | **89.8 ms** · 8,258 Mrays/s | 1.019× | 49.94 dB |
+| 2,804,474 三角形 | 512×512 | **30.1 ms** · 6,078 Mrays/s | 0.999× | 50.85 dB |
+| 2,804,474 三角形 | 1280×720 | **136.9 ms** · 5,418 Mrays/s | 1.002× | 49.93 dB |
 
 <details>
 <summary><b>测量方法</b>（点击展开）</summary>
@@ -103,23 +103,28 @@ A100、H100、H800 这类数据中心 GPU 没有 RT 核心，OptiX 在这些卡�
 
 ### 完整积分器
 
-在验证场景上测材质、纹理、环境光照与 MIS。两个渲染器都用[验证](#验证)中对齐的设置：1024 spp、8 次反弹、无俄罗斯轮盘、1 px 盒式滤波、同一张 HDRI。本渲染器的帧时间测法同上（`--batch 256`，CUDA graph 开启）。Cycles 4.2 OptiX 取开启 persistent data 的第二次渲染计时。PSNR 与均值差比较的就是这两次计时渲染的结果。
+在验证场景上测材质、纹理、环境光照与 MIS。两个渲染器都用[验证](#验证)中对齐的设置：1024 spp、8 次反弹、无俄罗斯轮盘、1 px 盒式滤波、同一张 HDRI。本渲染器的帧时间测法同上（`--batch 256`，CUDA graph 开启）。Cycles 4.2 OptiX 取开启 persistent data 的第二次渲染计时。PSNR 与均值差比较的就是这两次计时渲染的结果。glTF 模型的均值只在物体像素上计算。
 
 | 场景 | 分辨率 | 三角形 | 本渲染器 | Cycles OptiX | 加速 | 对 Cycles 的 PSNR | 平均亮度，本渲染器相对 Cycles |
 |---|---|---|---|---|---|---|---|
-| 材质球 | 640×256 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 黄铜花瓶（glTF，带纹理） | 512×512 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 水泥猫（glTF，带纹理） | 512×512 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 实例化场景（11 个实例） | 640×256 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
+| 材质球 | 640×256 | 182,400 | **99.0 ms** · 2,485 Mrays/s | 481.4 ms | **4.9×** | 42.36 dB | −0.02%（全图） |
+| 黄铜花瓶（glTF，带纹理） | 512×512 | 21,440 | **102.2 ms** · 3,257 Mrays/s | 368.2 ms | **3.6×** | 46.65 dB | −0.29%（物体） |
+| 水泥猫（glTF，带纹理） | 512×512 | 11,950 | **134.1 ms** · 2,803 Mrays/s | 543.4 ms | **4.1×** | 41.17 dB | +5.17%（物体） |
+| 实例化场景（11 个实例） | 640×256 | 215,852（4 个网格） | **389.6 ms** · 1,089 Mrays/s | 1,592 ms | **4.1×** | 34.62 dB | +0.24%（全图） |
+
+有材质和纹理时，相对 Cycles OptiX 的加速为 3.6–4.9 倍，约为漫反射基准的一半。水泥猫的 +5.2% 是[验证](#验证)中解释的模型差异。
+
+<p align="center"><img src="docs/images/validation_split.jpg" width="860" alt="实例化场景的分屏对比：左半边由本渲染器渲染，右半边由 Blender Cycles OptiX 渲染，都是 1024 spp"></p>
+<p align="center"><sub>表中的实例化场景。左半边：本渲染器（390 ms）。右半边：Cycles OptiX（1.59 s）。都是 1024 spp。</sub></p>
 
 ### BVH 构建：GPU 上的 H-PLOC 对比 CPU 上的分箱 SAH
 
 | 网格 | 布局 | CPU 分箱 SAH（单线程） | GPU 上的 H-PLOC（+ 主机端后处理） | SAH 代价，CPU / H-PLOC |
 |---|---|---|---|---|
-| 2,804,474 三角形 | BVH2 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 2,804,474 三角形 | CWBVH | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 合成场景，2,020,400 三角形 | BVH2 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 合成场景，2,020,400 三角形 | CWBVH | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
+| 2,804,474 三角形 | BVH2 | 6,199 ms | 1.74 ms (+322 ms) | 6.959 / 2.686 |
+| 2,804,474 三角形 | CWBVH | 8,558 ms | 1.74 ms (+404 ms) | 1.336 / 1.336 |
+| 合成场景，2,020,400 三角形 | BVH2 | 4,161 ms | 1.29 ms (+226 ms) | 50.669 / 55.179 |
+| 合成场景，2,020,400 三角形 | CWBVH | 5,874 ms | 1.29 ms (+290 ms) | 15.511 / 17.212 |
 
 H-PLOC 时间是 Morton 码、排序和聚类的 GPU 时间。后处理是下载与主机端的叶子优化（BVH2）或宽节点塌缩（CWBVH）。H-PLOC 树在 280 万三角形网格上遍历速度与 SAH 树相同，但在合成场景上慢 4–9%，那里它的 SAH 代价高 9–11%。所以静态网格仍默认用 CPU SAH 构建器；H-PLOC 每帧构建 TLAS，也可用 `--builder hploc` 选用。
 
@@ -127,12 +132,12 @@ H-PLOC 时间是 Morton 码、排序和聚类的 GPU 时间。后处理是下载
 
 | 方式 | 每帧 ms | Mrays/s | 相对默认 |
 |---|---|---|---|
-| CUDA graph，融合内核（默认） | TBD (P5 timing) | TBD (P5 timing) | 1.00 |
-| 主机循环发射 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| CUDA graph + 持久线程 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 主机循环 + 持久线程 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
+| CUDA graph，融合内核（默认） | 98.8 ms | 2,491 | 1.00 |
+| 主机循环发射 | 95.8 ms | 2,569 | 1.03 |
+| CUDA graph + 持久线程 | 120.2 ms | 2,046 | 0.82 |
+| 主机循环 + 持久线程 | 116.8 ms | 2,106 | 0.85 |
 
-在 `--batch 1` 下四种方式的图像逐位相同。
+在 `--batch 1` 下四种方式的图像逐位相同。`--batch 256` 时一个 pass 只有少量大内核，这里主机循环比 graph 快 3%。graph 是根据此前在共享 GPU 上、batch 64 与 4 的同会话对比设为默认的，当时几何平均快 1.43 倍；pass 越小它的收益越大。持久线程在这个场景上慢 15–18%。
 
 > [!IMPORTANT]
 > 这是一个专用内核，与通用生产渲染器在一个特意对齐的负载上比较。加速比说明的是专注的 wavefront 设计能从 CUDA 核心中榨出多少性能，并不意味着它能取代 Cycles。遇到带纹理或有光泽的材质、多光源、室内长路径时，差距会缩小。在**有** RT 核心的 GPU 上，硬件 OptiX 遍历应当远快于本仓库的任何实现；这一点我们没有测。
@@ -163,7 +168,7 @@ flowchart TD
 - **材质与采样**：模型见[材质](#材质)。每个路径顶点取一个光源样本（太阳、按功率选的自发光三角形，或按亮度 × sin θ 选的环境贴图像素）和一个 BSDF 样本，用幂启发式组合。
 - **环境贴图**：等距柱状投影的 Radiance `.hdr`，按像素的二维 CDF 采样。在材质场景上，同样本数下逐像素方差比均匀球面采样低 4.2 倍。
 - **Wavefront**：`--batch K` 每次 pass 发射 K·W·H 条路径。K = 1 时一帧 512×512 每次反弹只有 26 万条光线，远不够 H800 的 132 个 SM 吃。增大到 K = 64（1680 万条路径在飞）后 BVH2 吞吐提高 12–17 倍，一直到 K = 256 仍有收益。
-- **CUDA graph 与持久线程**：完整积分器把一个 pass 中的内核序列（队列计数在设备端）录制一次，之后作为 graph 重放，这是默认设置。`--persistent 1` 只启动恰好占满 GPU 的线程数，线程做完一条光线就从队列取下一条。它只在部分场景上有利，所以保持可选。
+- **CUDA graph 与持久线程**：完整积分器把一个 pass 中的内核序列（队列计数在设备端）录制一次，之后作为 graph 重放，这是默认设置；batch 小时收益最大（见[发射方式表](#内核发射方式完整积分器材质球场景)）。`--persistent 1` 只启动恰好占满 GPU 的线程数，线程做完一条光线就从队列取下一条。它只在部分场景上有利，所以保持可选。
 - **可复现性**：随机数由 (像素, 样本, 深度, 维度, 种子) 的无状态哈希生成，每条路径都可复现。像素累加使用浮点原子操作，所以 `--batch` > 1 时两次运行可能在最后一位不同；`--batch 1` 时逐位可复现。
 
 ## 验证

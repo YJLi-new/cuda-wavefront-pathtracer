@@ -74,14 +74,14 @@ These are the published numbers of the diffuse benchmark path (first release, co
 | 2,804,474 triangles | 512×512 | **30.1 ms** · 6,086 Mrays/s | 232 ms · ≈787 Mrays/s | 250 ms | **7.7×** | 50.85 dB |
 | 2,804,474 triangles | 1280×720 | **137.2 ms** · 5,407 Mrays/s | 1,048 ms · ≈708 Mrays/s | 1,115 ms | **7.6×** | 49.93 dB |
 
-**Re-measured with this release.** Same card model, same scene and the same configuration, with the binary of this release.
+**Re-measured with this release.** Same card model, same scene and the same configuration, with the binary of this release (timed 2026-10-17). All four rows are within −0.1% to +2.3% of the published throughput, and the images match Cycles as before.
 
 | Scene | Resolution | This release | vs published Mrays/s | PSNR vs Cycles |
 |---|---|---|---|---|
-| 116,855 triangles | 512×512 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 116,855 triangles | 1280×720 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 2,804,474 triangles | 512×512 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 2,804,474 triangles | 1280×720 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
+| 116,855 triangles | 512×512 | **21.0 ms** · 8,704 Mrays/s | 1.023× | 50.86 dB |
+| 116,855 triangles | 1280×720 | **89.8 ms** · 8,258 Mrays/s | 1.019× | 49.94 dB |
+| 2,804,474 triangles | 512×512 | **30.1 ms** · 6,078 Mrays/s | 0.999× | 50.85 dB |
+| 2,804,474 triangles | 1280×720 | **136.9 ms** · 5,418 Mrays/s | 1.002× | 49.93 dB |
 
 <details>
 <summary><b>How these numbers were measured</b> (click to expand)</summary>
@@ -104,23 +104,28 @@ These are the published numbers of the diffuse benchmark path (first release, co
 
 ### Full integrator
 
-Materials, textures, environment lighting and MIS, on the validation scenes. Both renderers use the matched settings of the [validation](#validation): 1024 spp, 8 bounces, no Russian roulette, 1 px box filter, the same HDRI. Our frame time is measured as above (`--batch 256`, CUDA graph on). Cycles 4.2 OptiX is timed on the second render with persistent data. PSNR and mean difference compare the two timed renders.
+Materials, textures, environment lighting and MIS, on the validation scenes. Both renderers use the matched settings of the [validation](#validation): 1024 spp, 8 bounces, no Russian roulette, 1 px box filter, the same HDRI. Our frame time is measured as above (`--batch 256`, CUDA graph on). Cycles 4.2 OptiX is timed on the second render with persistent data. PSNR and mean difference compare the two timed renders. For the glTF models the mean is taken over the object's pixels.
 
 | Scene | Resolution | Triangles | This renderer | Cycles OptiX | Speedup | PSNR vs Cycles | Mean luminance, ours vs Cycles |
 |---|---|---|---|---|---|---|---|
-| Material spheres | 640×256 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| Brass vase (glTF, textured) | 512×512 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| Concrete cat (glTF, textured) | 512×512 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| Instanced scene (11 instances) | 640×256 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
+| Material spheres | 640×256 | 182,400 | **99.0 ms** · 2,485 Mrays/s | 481.4 ms | **4.9×** | 42.36 dB | −0.02% (image) |
+| Brass vase (glTF, textured) | 512×512 | 21,440 | **102.2 ms** · 3,257 Mrays/s | 368.2 ms | **3.6×** | 46.65 dB | −0.29% (object) |
+| Concrete cat (glTF, textured) | 512×512 | 11,950 | **134.1 ms** · 2,803 Mrays/s | 543.4 ms | **4.1×** | 41.17 dB | +5.17% (object) |
+| Instanced scene (11 instances) | 640×256 | 215,852 in 4 meshes | **389.6 ms** · 1,089 Mrays/s | 1,592 ms | **4.1×** | 34.62 dB | +0.24% (image) |
+
+With materials and textures the speedup over Cycles OptiX is 3.6–4.9×, about half of the diffuse benchmark's. The +5.2% of the concrete cat is the model difference explained under [Validation](#validation).
+
+<p align="center"><img src="docs/images/validation_split.jpg" width="860" alt="Split view of the instanced scene: left half rendered by this renderer, right half by Blender Cycles OptiX, both at 1024 spp"></p>
+<p align="center"><sub>The instanced scene from the table. Left half: this renderer (390 ms). Right half: Cycles OptiX (1.59 s). Both 1024 spp.</sub></p>
 
 ### BVH build: H-PLOC on the GPU vs binned SAH on the CPU
 
 | Mesh | Layout | CPU binned SAH (1 thread) | H-PLOC on the GPU (+ host post-processing) | SAH cost, CPU / H-PLOC |
 |---|---|---|---|---|
-| 2,804,474 triangles | BVH2 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| 2,804,474 triangles | CWBVH | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| synthetic, 2,020,400 triangles | BVH2 | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| synthetic, 2,020,400 triangles | CWBVH | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
+| 2,804,474 triangles | BVH2 | 6,199 ms | 1.74 ms (+322 ms) | 6.959 / 2.686 |
+| 2,804,474 triangles | CWBVH | 8,558 ms | 1.74 ms (+404 ms) | 1.336 / 1.336 |
+| synthetic, 2,020,400 triangles | BVH2 | 4,161 ms | 1.29 ms (+226 ms) | 50.669 / 55.179 |
+| synthetic, 2,020,400 triangles | CWBVH | 5,874 ms | 1.29 ms (+290 ms) | 15.511 / 17.212 |
 
 H-PLOC time is the GPU time of Morton codes, sort and clustering. Post-processing is the download and the host-side leaf optimisation (BVH2) or wide collapse (CWBVH). H-PLOC trees trace as fast as SAH trees on the 2.8M-triangle mesh but 4–9% slower on the synthetic scene, where their SAH cost is 9–11% higher. So the CPU SAH builder stays the default for static meshes, and H-PLOC builds the TLAS every frame and is available with `--builder hploc`.
 
@@ -128,12 +133,12 @@ H-PLOC time is the GPU time of Morton codes, sort and clustering. Post-processin
 
 | Mode | ms per frame | Mrays/s | vs default |
 |---|---|---|---|
-| CUDA graph, fused kernels (default) | TBD (P5 timing) | TBD (P5 timing) | 1.00 |
-| Host launch loop | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| CUDA graph + persistent threads | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
-| Host loop + persistent threads | TBD (P5 timing) | TBD (P5 timing) | TBD (P5 timing) |
+| CUDA graph, fused kernels (default) | 98.8 ms | 2,491 | 1.00 |
+| Host launch loop | 95.8 ms | 2,569 | 1.03 |
+| CUDA graph + persistent threads | 120.2 ms | 2,046 | 0.82 |
+| Host loop + persistent threads | 116.8 ms | 2,106 | 0.85 |
 
-All four modes produce bitwise-identical images at `--batch 1`.
+All four modes produce bitwise-identical images at `--batch 1`. At `--batch 256` a pass has few, large kernel launches, and here the host loop was 3% faster than the graph. The graph was made the default after an earlier same-session comparison at batch 64 and 4 on a shared GPU, where it gained 1.43× in geometric mean; it helps most when passes are small. Persistent threads were 15–18% slower on this scene.
 
 > [!IMPORTANT]
 > This is a specialized kernel compared with a general production renderer on a workload chosen to match it. The speedup shows what a focused wavefront design can extract from CUDA cores. It does not mean this code replaces Cycles. The gap will shrink with textured or glossy materials, many lights, and long indoor paths. On GPUs **with** RT cores, hardware OptiX traversal should be far faster than anything in this repo; we have not measured that.
@@ -164,7 +169,7 @@ flowchart TD
 - **Materials and sampling.** See [Materials](#materials) for the model. Each path vertex takes one light sample (sun, emissive triangle by power, or environment texel by luminance × sin θ) and one BSDF sample, combined by the power heuristic.
 - **Environment map.** Equirectangular Radiance `.hdr`, sampled from a 2D CDF over its texels. At equal sample count this lowered the per-pixel variance by 4.2× on the material scene compared with uniform sphere sampling.
 - **Wavefront.** `--batch K` launches K·W·H paths per pass. With K = 1 a 512×512 frame has only 262k rays per bounce, far too few for the 132 SMs of an H800. Going to K = 64 (16.8 M paths in flight) gives 12–17× more throughput with BVH2, and the gains continue up to K = 256.
-- **CUDA graphs and persistent threads.** For the full integrator the sequence of kernels in one pass, with device-side queue counts, is captured once and replayed as a graph. This is the default. `--persistent 1` launches just enough threads to fill the GPU, and threads that finish a ray fetch the next one from the queue. It helps on some scenes only and stays opt-in.
+- **CUDA graphs and persistent threads.** For the full integrator the sequence of kernels in one pass, with device-side queue counts, is captured once and replayed as a graph. This is the default; it pays off most for small batches (see the [launch-mode table](#kernel-launch-modes-full-integrator-material-spheres)). `--persistent 1` launches just enough threads to fill the GPU, and threads that finish a ray fetch the next one from the queue. It helps on some scenes only and stays opt-in.
 - **Determinism.** Random numbers come from a stateless hash of (pixel, sample, depth, dimension, seed), so every path is reproducible. Pixel accumulation uses float atomics, so runs with `--batch` > 1 can differ in the last bit. With `--batch 1` they are bitwise reproducible.
 
 <a id="validation"></a>
