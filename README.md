@@ -120,7 +120,7 @@ Steps 2–6 together are 1.43–1.58× faster than the K = 64 baseline with sepa
 
 ## Build
 
-You need the CUDA toolkit (nvcc) and a C++17 host compiler. Building does not need a GPU.
+You need the CUDA toolkit (nvcc), a C++17 host compiler and CMake 3.22 or newer. Building does not need a GPU. `build.sh` is a thin wrapper around CMake; if CMake is not installed it falls back to calling nvcc directly.
 
 ```bash
 git clone https://github.com/YJLi-new/cuda-wavefront-pathtracer.git
@@ -131,6 +131,12 @@ cd cuda-wavefront-pathtracer && ./build.sh
 ```
 
 The build targets `sm_90` by default. For other GPUs set `ARCH`, for example `ARCH=sm_80 ./build.sh` for an A100 or `ARCH=sm_89 ./build.sh` for an RTX 40-series card. Only sm_90 has been tuned and tested. `VARIANTS=1 ./build.sh` also builds the register-cap variants used in the ablation.
+
+With CMake directly:
+
+```bash
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=90 && cmake --build build -j
+```
 
 ## Run
 
@@ -227,16 +233,17 @@ If `albedo_rgb_linear_by_material_index` is present it replaces the mesh's mater
 ## Repository layout
 
 ```
-src/main.cu       kernels (raygen, fused trace+shade, shade, shadow) and the host driver
-src/bvh.h         binned-SAH BVH2 builder; BVH2 and BVH4 GPU layouts; triangle packing
-src/bvh8.h        compressed 8-wide BVH and Woop triangle packing
-src/mesh.h        OBJ/MTL and PLY loaders; synthetic scene generator
-src/vec.h         float3 helpers
-src/png.h         minimal PNG and PFM writers
+src/core/         float3 helpers, hash RNG, sampling warps (host + device, header-only)
+src/scene/        mesh, camera and lighting types; synthetic scene generator
+src/accel/        binned-SAH BVH2 builder; BVH2/BVH4/compressed BVH8 GPU layouts; triangle packing; device traversal
+src/render/       wavefront kernels (raygen, fused trace+shade, shade, shadow) and the host driver
+src/io/           OBJ/MTL and PLY loaders; camera and lighting JSON; PNG and PFM writers
+src/app/pt.cpp    the batch renderer CLI (build/pt)
 tools/psnr.py     PSNR in tonemapped sRGB (PNG, PFM or EXR inputs)
 scripts/          benchmark preset
 examples/         small OBJ scene with camera and lighting JSON
-build.sh          build script (ARCH, VARIANTS)
+CMakeLists.txt    build (one static library per module)
+build.sh          wrapper around CMake (ARCH, VARIANTS)
 ```
 
 ## Acknowledgements

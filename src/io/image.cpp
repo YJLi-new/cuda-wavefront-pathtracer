@@ -1,10 +1,7 @@
-// png.h - minimal PNG (stored/uncompressed deflate) and PFM writers (written from scratch)
-#pragma once
+// io/image.cpp - minimal PNG (stored/uncompressed deflate) and PFM writers (written from scratch)
+#include "io/image.h"
+#include <cmath>
 #include <cstdio>
-#include <cstdint>
-#include <vector>
-#include <string>
-
 static uint32_t crcTable[256];
 static void crcInit() { for (uint32_t n = 0; n < 256; n++) { uint32_t c = n; for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1; crcTable[n] = c; } }
 static uint32_t crc32buf(const uint8_t* b, size_t n, uint32_t c = 0xFFFFFFFFu) { for (size_t i = 0; i < n; i++) c = crcTable[(c ^ b[i]) & 0xFF] ^ (c >> 8); return c; }
@@ -16,7 +13,7 @@ static void chunk(FILE* fp, const char* type, const std::vector<uint8_t>& data) 
     fwrite(b.data(), 1, 4, fp); fwrite(td.data(), 1, td.size(), fp);
     std::vector<uint8_t> cb; put32(cb, c); fwrite(cb.data(), 1, 4, fp);
 }
-static bool writePNG(const std::string& path, int w, int h, const uint8_t* rgb) {
+bool writePNG(const std::string& path, int w, int h, const uint8_t* rgb) {
     static bool init = false; if (!init) { crcInit(); init = true; }
     FILE* fp = fopen(path.c_str(), "wb"); if (!fp) return false;
     const uint8_t sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 }; fwrite(sig, 1, 8, fp);
@@ -39,9 +36,15 @@ static bool writePNG(const std::string& path, int w, int h, const uint8_t* rgb) 
     fclose(fp); return true;
 }
 // PFM: linear float RGB, little endian, bottom-to-top rows
-static bool writePFM(const std::string& path, int w, int h, const float* rgb) {
+bool writePFM(const std::string& path, int w, int h, const float* rgb) {
     FILE* fp = fopen(path.c_str(), "wb"); if (!fp) return false;
     fprintf(fp, "PF\n%d %d\n-1.0\n", w, h);
     for (int y = h - 1; y >= 0; y--) fwrite(rgb + (size_t)y * w * 3, sizeof(float), (size_t)w * 3, fp);
     fclose(fp); return true;
+}
+void tonemapSRGB8(const float* lin, size_t nPix, uint8_t* rgb) {
+    for (size_t i = 0; i < nPix * 3; i++) {
+        float x = fminf(fmaxf(lin[i], 0.f), 1.f); x = x <= 0.0031308f ? 12.92f * x : 1.055f * powf(x, 1.f / 2.4f) - 0.055f;
+        rgb[i] = (uint8_t)(x * 255.f + 0.5f);
+    }
 }

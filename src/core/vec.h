@@ -1,4 +1,4 @@
-// vec.h - minimal float3 helpers usable on host and device (written from scratch)
+// core/vec.h - minimal float3 helpers usable on host and device (written from scratch)
 #pragma once
 #include <cuda_runtime.h>
 #include <math.h>

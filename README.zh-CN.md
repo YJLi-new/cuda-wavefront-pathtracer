@@ -118,7 +118,7 @@ flowchart TD
 
 ## 构建
 
-需要 CUDA 工具包（nvcc）和支持 C++17 的主机编译器。构建不需要 GPU。
+需要 CUDA 工具包（nvcc）、支持 C++17 的主机编译器和 CMake 3.22 或更新版本。构建不需要 GPU。`build.sh` 只是 CMake 的薄封装；没有安装 CMake 时它会直接调用 nvcc。
 
 ```bash
 git clone https://github.com/YJLi-new/cuda-wavefront-pathtracer.git
@@ -129,6 +129,12 @@ cd cuda-wavefront-pathtracer && ./build.sh
 ```
 
 默认目标为 `sm_90`。其他 GPU 请设置 `ARCH`，例如 A100 用 `ARCH=sm_80 ./build.sh`，RTX 40 系列用 `ARCH=sm_89 ./build.sh`。只有 sm_90 经过调优和测试。`VARIANTS=1 ./build.sh` 会额外构建消融中用到的寄存器上限变体。
+
+直接用 CMake：
+
+```bash
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=90 && cmake --build build -j
+```
 
 ## 运行
 
@@ -225,16 +231,17 @@ BATCH=64 scripts/bench_synthetic.sh
 ## 目录结构
 
 ```
-src/main.cu       内核（光线生成、融合遍历着色、着色、阴影）与主机驱动
-src/bvh.h         分箱 SAH BVH2 构建器；BVH2 与 BVH4 的 GPU 布局；三角形打包
-src/bvh8.h        压缩 8 叉 BVH 与 Woop 三角形打包
-src/mesh.h        OBJ/MTL 与 PLY 读取；合成场景生成
-src/vec.h         float3 工具函数
-src/png.h         最小化的 PNG 与 PFM 写出
+src/core/         float3 工具函数、哈希随机数、采样变换（主机与设备共用，仅头文件）
+src/scene/        网格、相机与光照类型；合成场景生成
+src/accel/        分箱 SAH BVH2 构建器；BVH2/BVH4/压缩 8 叉 BVH 的 GPU 布局；三角形打包；设备端遍历
+src/render/       wavefront 内核（光线生成、融合遍历着色、着色、阴影）与主机驱动
+src/io/           OBJ/MTL 与 PLY 读取；相机与光照 JSON；PNG 与 PFM 写出
+src/app/pt.cpp    批渲染命令行程序（build/pt）
 tools/psnr.py     在色调映射后的 sRGB 上算 PSNR（支持 PNG、PFM、EXR）
 scripts/          基准预设
 examples/         小型 OBJ 示例场景及相机、光照 JSON
-build.sh          构建脚本（ARCH、VARIANTS）
+CMakeLists.txt    构建（每个模块一个静态库）
+build.sh          CMake 封装脚本（ARCH、VARIANTS）
 ```
 
 ## 致谢
