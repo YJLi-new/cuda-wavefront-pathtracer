@@ -16,6 +16,7 @@ struct Params {
 };
 
 #include "scene/material.h"
+#include "scene/texture.h"
 
 // light-sampling strategies for emitters and the environment map (the sun is always light-sampled)
 enum LightMode { kLightMIS = 0, kLightNEE = 1, kLightBSDF = 2 };
@@ -28,4 +29,9 @@ struct FullParams {
     const float4* envTex; const float* envMarg; const float* envCond; int envW, envH; float envRot;
     float pSun, pTri, pEnv;        // light-type selection probabilities for next-event estimation
     int lightMode, rr, rrDepth, hasEnv, gdEnergy;
+    int envUniform;                // 1: environment light samples uniform on the sphere instead of by luminance (tests)
+    int bumpShadow;                // 1: bump-terminator shadowing of the diffuse lobe for normal-mapped hits (render/bsdf.h)
+    // textures (nullptr when no material is textured): per-material bindings, texture objects, per-triangle corner
+    // uvs (2 float4) and tangents (3 float4) in BVH leaf order
+    const MaterialTextures* mtex; int nMtex; const cudaTextureObject_t* texObj; const float4* uvs; const float4* tans;
 };

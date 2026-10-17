@@ -36,3 +36,13 @@ void packWoop(const Mesh& m, const std::vector<int>& order, std::vector<float4>&
         }
     }
 }
+
+void packAttributes(const Mesh& m, const std::vector<int>& order, std::vector<float4>& uvs, std::vector<float4>& tans) {
+    size_t n = order.size(); uvs.resize(2 * n); if (m.hasTan()) tans.resize(3 * n);
+    for (size_t k = 0; k < n; k++) {
+        int3 f = m.f[order[k]];
+        float2 a = m.uv[f.x], b = m.uv[f.y], c = m.uv[f.z];
+        uvs[2 * k] = make_float4(a.x, a.y, b.x, b.y); uvs[2 * k + 1] = make_float4(c.x, c.y, 0.f, 0.f);
+        if (m.hasTan()) { tans[3 * k] = m.tan[f.x]; tans[3 * k + 1] = m.tan[f.y]; tans[3 * k + 2] = m.tan[f.z]; }
+    }
+}

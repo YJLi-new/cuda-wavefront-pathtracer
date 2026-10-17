@@ -65,8 +65,17 @@ struct BsdfEval { float3 f; float pdf; };
 //   energy = 1: kd = 1 - X, E[X] = E_spec(wo)  (albedo scaling: X = ws F(wo.m) G2 / G1(wo) for one visible normal
 //               m drawn with (ux1, ux2), an unbiased estimate of the specular lobe's directional albedo, so the
 //               expected albedo is E_spec + (1 - E_spec) * base <= 1). Lobe selection uses F(wo.z) in both modes.
+// Optional bump-terminator shadowing of the diffuse lobe (Chiang, Li, Burley, "Taming the Shadow Terminator", SIGGRAPH 2019
+// talk): with nr = the unperturbed (interpolated) normal in the local frame of the normal-mapped shading normal,
+// g = (nr . wi) / (wi.z nr.z), G = 1 for g >= 1, 0 for g < 0, else -g^3 + g^2 + g. nr = (0,0,1) gives G = 1 exactly (off).
+HD float bumpShadowing(float3 nr, float3 wi) {
+    if (nr.z >= 1.f) return 1.f;
+    float g = dot(nr, wi) / (wi.z * nr.z); if (g >= 1.f) return 1.f; if (g < 0.f) return 0.f;
+    return g + g * g - g * g * g;
+}
+
 struct GlossyDiffuse {
-    float3 base; float ws, eta, a, a2; bool delta; float Fo, pSpec, kd;
+    float3 base; float ws, eta, a, a2; bool delta; float Fo, pSpec, kd; float3 nr = mk3(0.f, 0.f, 1.f);
     HD GlossyDiffuse(const Material& m, float3 wo, int energy, float ux1, float ux2) {
         base = m.baseColor; ws = m.specularWeight; eta = m.ior; a = m.roughness * m.roughness; a2 = a * a; delta = a < kDeltaAlpha;
         Fo = ws > 0.f ? ws * fresnelDielectric(wo.z, eta) : 0.f;
@@ -82,7 +91,7 @@ struct GlossyDiffuse {
     HD BsdfEval eval(float3 wo, float3 wi) const {
         BsdfEval r; r.f = mk3(0.f, 0.f, 0.f); r.pdf = 0.f;
         if (wi.z <= 0.f) return r;
-        r.f = base * (kd * CWP_INV_PI); r.pdf = (1.f - pSpec) * wi.z * CWP_INV_PI;
+        r.f = base * (kd * CWP_INV_PI * bumpShadowing(nr, wi)); r.pdf = (1.f - pSpec) * wi.z * CWP_INV_PI;
         if (!delta && Fo > 0.f) {
             float3 m = normalize(wo + wi); float om = dot(wo, m);
             if (om > 0.f) {
@@ -182,28 +191,29 @@ HD bool bsdfHasNonDelta(const Material& m) {
 
 // f and pdf (solid angle) of all non-delta lobes; etaRel is used by the transmissive base only;
 // gdEnergy / ux1 / ux2: glossy-diffuse energy compensation switch and its two random numbers (see GlossyDiffuse)
-HD BsdfEval bsdfEval(const Material& m, float3 wo, float3 wi, float etaRel, int gdEnergy, float ux1, float ux2) {
+// nr: unperturbed normal in the local frame for the optional bump-terminator term of the diffuse lobe (default: off)
+HD BsdfEval bsdfEval(const Material& m, float3 wo, float3 wi, float etaRel, int gdEnergy, float ux1, float ux2, float3 nr = mk3(0.f, 0.f, 1.f)) {
     float wM, wT, wD; baseWeights(m, wM, wT, wD);
     BsdfEval r; r.f = mk3(0.f, 0.f, 0.f); r.pdf = 0.f;
     if (wM > 0.f) { BsdfEval e = Conductor(m).eval(wo, wi); r.f = r.f + e.f * wM; r.pdf += wM * e.pdf; }
     if (wT > 0.f) { BsdfEval e = Dielectric(m, etaRel).eval(wo, wi); r.f = r.f + e.f * wT; r.pdf += wT * e.pdf; }
-    if (wD > 0.f) { BsdfEval e = GlossyDiffuse(m, wo, gdEnergy, ux1, ux2).eval(wo, wi); r.f = r.f + e.f * wD; r.pdf += wD * e.pdf; }
+    if (wD > 0.f) { GlossyDiffuse g(m, wo, gdEnergy, ux1, ux2); g.nr = nr; BsdfEval e = g.eval(wo, wi); r.f = r.f + e.f * wD; r.pdf += wD * e.pdf; }
     return r;
 }
 
 // Samples wi. weight = f |cos| / pdf of the whole material (one-sample MIS over the bases); pdf = 0 for delta samples.
-HD bool bsdfSample(const Material& m, float3 wo, float etaRel, int gdEnergy, float ux1, float ux2, float u, float u1, float u2, float3& wi, float3& weight, float& pdf) {
+HD bool bsdfSample(const Material& m, float3 wo, float etaRel, int gdEnergy, float ux1, float ux2, float u, float u1, float u2, float3& wi, float3& weight, float& pdf, float3 nr = mk3(0.f, 0.f, 1.f)) {
     float wM, wT, wD; baseWeights(m, wM, wT, wD);
     bool ok;
     if (u < wM) { ok = Conductor(m).sample(wo, u1, u2, wi, weight, pdf); }
     else if (u < wM + wT) { float uu = (u - wM) / wT; ok = Dielectric(m, etaRel).sample(wo, fminf(uu, 0.99999994f), u1, u2, wi, weight, pdf); }
-    else { float uu = wD > 0.f ? (u - wM - wT) / wD : 0.f; ok = GlossyDiffuse(m, wo, gdEnergy, ux1, ux2).sample(wo, fminf(uu, 0.99999994f), u1, u2, wi, weight, pdf); }
+    else { float uu = wD > 0.f ? (u - wM - wT) / wD : 0.f; GlossyDiffuse g(m, wo, gdEnergy, ux1, ux2); g.nr = nr; ok = g.sample(wo, fminf(uu, 0.99999994f), u1, u2, wi, weight, pdf); }
     if (!ok) return false;
     if (pdf <= 0.f) return true;                         // delta: other bases have no density there
     if (wM == 1.f || wT == 1.f || wD == 1.f) {           // single base: its own weight is already f|cos|/pdf
         return true;
     }
-    BsdfEval e = bsdfEval(m, wo, wi, etaRel, gdEnergy, ux1, ux2); if (e.pdf <= 0.f) return false;
+    BsdfEval e = bsdfEval(m, wo, wi, etaRel, gdEnergy, ux1, ux2, nr); if (e.pdf <= 0.f) return false;
     weight = e.f * (fabsf(wi.z) / e.pdf); pdf = e.pdf; return true;
 }
 

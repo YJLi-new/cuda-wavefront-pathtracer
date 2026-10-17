@@ -41,3 +41,18 @@ inline void buildBlackmanHarrisTable(float* tab, int n, double width) {
     for (int i = 0; i <= NS; i++) cdf[i] /= cdf[NS];
     for (int k = 0; k <= n; k++) { double u = (double)k / n; int j = 0; while (j < NS - 1 && cdf[j + 1] < u) j++; double t = (cdf[j + 1] > cdf[j]) ? (u - cdf[j]) / (cdf[j + 1] - cdf[j]) : 0.0; tab[k] = (float)(((j + t) / NS - 0.5) * width); }
 }
+
+// uniform point on the unit disk, concentric mapping (Shirley & Chiu, "A Low Distortion Map Between Disk and Square", 1997)
+HD void sampleConcentricDisk(float u0, float u1, float& x, float& y) {
+    float a = 2.f * u0 - 1.f, b = 2.f * u1 - 1.f;
+    if (a == 0.f && b == 0.f) { x = y = 0.f; return; }
+    float r, ph;
+    if (fabsf(a) > fabsf(b)) { r = a; ph = 0.78539816f * (b / a); } else { r = b; ph = 1.57079633f - 0.78539816f * (a / b); }
+    x = r * cosf(ph); y = r * sinf(ph);
+}
+
+// uniform direction on the unit sphere (pdf = 1 / (4 pi))
+HD float3 sampleUniformSphere(float u0, float u1) {
+    float z = 1.f - 2.f * u0, r = sqrtf(fmaxf(0.f, 1.f - z * z)), ph = CWP_TWO_PI * u1;
+    return mk3(r * cosf(ph), r * sinf(ph), z);
+}

@@ -45,7 +45,14 @@ __global__ void k_raygen(float4* pO, float4* pD, float4* pT, int* pDepth, int* q
     if (P.filterBH) { jx = sampleTable(P.ftab, kFilterTable, u0); jy = sampleTable(P.ftab, kFilterTable, u1); } else { jx = u0 - 0.5f; jy = u1 - 0.5f; }
     float dx = (x + 0.5f + jx - P.cam.px) / P.cam.fx, dy = -(y + 0.5f + jy - P.cam.py) / P.cam.fy;
     float3 d = normalize(P.cam.ax * dx + P.cam.ay * dy - P.cam.az);
-    pO[i] = mk4(P.cam.pos, P.near); pD[i] = mk4(d, 1e30f); pT[i] = make_float4(1.f, 1.f, 1.f, __int_as_float(pix)); pDepth[i] = 0; q[i] = i;
+    float3 o = P.cam.pos;
+    if (P.cam.lensR > 0.f) {   // thin lens: origin on the lens disk, aimed at the pinhole ray's point on the focal plane
+        float lx, ly; sampleConcentricDisk(rnd(pix, smp, 0, 2), rnd(pix, smp, 0, 3), lx, ly);
+        float3 pf = P.cam.pos + (P.cam.ax * dx + P.cam.ay * dy - P.cam.az) * P.cam.focusD;
+        o = P.cam.pos + P.cam.ax * (lx * P.cam.lensR) + P.cam.ay * (ly * P.cam.lensR);
+        d = normalize(pf - o);
+    }
+    pO[i] = mk4(o, P.near); pD[i] = mk4(d, 1e30f); pT[i] = make_float4(1.f, 1.f, 1.f, __int_as_float(pix)); pDepth[i] = 0; q[i] = i;
 }
 
 // ---------------- trace kernels ----------------
@@ -182,7 +189,17 @@ __device__ __forceinline__ float envPdfTexel(int x, int y, float v) {
     float puv = (PF.envMarg[y + 1] - PF.envMarg[y]) * (cr[x + 1] - cr[x]) * PF.envW * PF.envH;
     float st = sinf(v * CWP_PI); return st > 0.f ? puv / (2.f * CWP_PI * CWP_PI * st) : 0.f;
 }
-__device__ __forceinline__ float envPdf(float3 d) { int x, y; float v; envTexel(d, x, y, v); return envPdfTexel(x, y, v); }
+__device__ __forceinline__ float envPdf(float3 d) {
+    if (PF.envUniform) return 0.25f * CWP_INV_PI;
+    int x, y; float v; envTexel(d, x, y, v); return envPdfTexel(x, y, v);
+}
+// textures: corner-uv interpolation (b1, b2 = barycentric weights of corners 1 and 2) and an RGBA lookup
+__device__ __forceinline__ float2 triUV(int tri, float b1, float b2) {
+    float4 a = PF.uvs[2 * tri], c = PF.uvs[2 * tri + 1]; float b0 = 1.f - b1 - b2;
+    return make_float2(a.x * b0 + a.z * b1 + c.x * b2, a.y * b0 + a.w * b1 + c.y * b2);
+}
+__device__ __forceinline__ float4 texRGBA(int id, float2 uv) { return tex2D<float4>(PF.texObj[id], uv.x, 1.f - uv.y); }
+__device__ __forceinline__ float texComp(float4 c, int ch) { return ch == 0 ? c.x : ch == 1 ? c.y : ch == 2 ? c.z : c.w; }
 // largest i in [0, n) with cdf[i] <= u (cdf has n + 1 entries, cdf[0] = 0, cdf[n] = 1)
 __device__ __forceinline__ int cdfFind(const float* cdf, int n, float u) { int lo = 0, hi = n; while (hi - lo > 1) { int mid = (lo + hi) >> 1; if (cdf[mid] <= u) lo = mid; else hi = mid; } return lo; }
 
@@ -211,9 +228,30 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
     float3 ng0 = normalize(cross(xyz(b4), xyz(c4)));
     float3 ns = ng0;
     if (P.hasN) { float3 n0 = xyz(nrm[3 * tri]), n1 = xyz(nrm[3 * tri + 1]), n2 = xyz(nrm[3 * tri + 2]); float3 nn = n0 * (1.f - hu - hv) + n1 * hu + n2 * hv; float l = length(nn); if (l > 0.f) ns = nn * (1.f / l); if (dot(ns, ng0) < 0.f) ns = -ns; }
+    const int mid = __float_as_int(b4.w); float3 nsU = ns; bool mapped = false;   // nsU: unperturbed normal (bump-terminator term)
+    Material M = PF.mats[mid];
+    if (PF.mtex && mid < PF.nMtex) {   // textures multiply the material factors (glTF metallic-roughness semantics)
+        const MaterialTextures X = PF.mtex[mid];
+        if (hasTextures(X)) {
+            float2 uv = triUV(tri, hu, hv);
+            if (X.baseColor >= 0) M.baseColor = M.baseColor * xyz(texRGBA(X.baseColor, uv));
+            if (X.emission >= 0) M.emission = M.emission * xyz(texRGBA(X.emission, uv));
+            if (X.metallic >= 0) M.metallic *= texComp(texRGBA(X.metallic, uv), X.metallicCh);
+            if (X.roughness >= 0) M.roughness *= texComp(texRGBA(X.roughness, uv), X.roughnessCh);
+            if (X.normal >= 0 && PF.tans) {   // tangent-space normal map: n = T x + B y + N z, B = w cross(N, T)
+                float w0 = 1.f - hu - hv; float4 t0 = PF.tans[3 * tri], t1 = PF.tans[3 * tri + 1], t2 = PF.tans[3 * tri + 2];
+                float3 t = xyz(t0) * w0 + xyz(t1) * hu + xyz(t2) * hv; float sg = (t0.w * w0 + t1.w * hu + t2.w * hv) < 0.f ? -1.f : 1.f;
+                t = t - ns * dot(ns, t); float tl = length(t);
+                if (tl > 0.f) {
+                    t = t * (1.f / tl); float3 bt = cross(ns, t) * sg; float4 c = texRGBA(X.normal, uv);
+                    float3 nm = t * ((2.f * c.x - 1.f) * X.normalScale) + bt * ((2.f * c.y - 1.f) * X.normalScale) + ns * (2.f * c.z - 1.f);
+                    float nl = length(nm); if (nl > 0.f) { ns = nm * (1.f / nl); mapped = true; }
+                }
+            }
+        }
+    }
     bool front = dot(ng0, d) < 0.f;
-    float3 ng = front ? ng0 : -ng0; if (!front) ns = -ns;
-    const Material M = PF.mats[__float_as_int(b4.w)];
+    float3 ng = front ? ng0 : -ng0; if (!front) { ns = -ns; nsU = -nsU; }
     // emission (two-sided), MIS-weighted against light sampling of this triangle
     if (M.emission.x > 0.f || M.emission.y > 0.f || M.emission.z > 0.f) {
         float w = 1.f;
@@ -229,6 +267,8 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
     if (dot(ns, wo) <= 1e-6f) ns = ng;
     float3 tx, ty; onb(ns, tx, ty);
     float3 woL = mk3(dot(wo, tx), dot(wo, ty), dot(wo, ns));
+    float3 nrL = mk3(0.f, 0.f, 1.f);
+    if (PF.bumpShadow && mapped) { nrL = mk3(dot(nsU, tx), dot(nsU, ty), dot(nsU, ns)); if (!(nrL.z > 0.f)) nrL = mk3(0.f, 0.f, 1.f); }
     float eta = front ? M.ior : 1.f / M.ior;
     float3 poUp = p + ng * P.eps, poDn = p - ng * P.eps;
     float ux1 = rnd(pix, smp, depth + 1, 7), ux2 = rng4(pix, smp, depth + 1, 7, P.seed ^ 0x68E31DA4u);   // glossy-diffuse albedo estimate
@@ -248,8 +288,13 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
             float3 dv = pL - org; float dist2 = dot(dv, dv), dist = sqrtf(dist2);
             if (dist > 0.f) {
                 l = dv * (1.f / dist); float cl = fabsf(dot(nL, l));
-                if (cl > 0.f) { pl = PF.pTri * PF.triLightPdf[kt] * dist2 / cl; Le = PF.mats[__float_as_int(a1.w)].emission; tmax = dist * (1.f - 1e-3f); ok = true; }
+                if (cl > 0.f) {
+                    int lm = __float_as_int(a1.w); pl = PF.pTri * PF.triLightPdf[kt] * dist2 / cl; Le = PF.mats[lm].emission; tmax = dist * (1.f - 1e-3f); ok = true;
+                    if (PF.mtex && lm < PF.nMtex && PF.mtex[lm].emission >= 0) Le = Le * xyz(texRGBA(PF.mtex[lm].emission, triUV(kt, su * (1.f - u3), su * u3)));
+                }
             }
+        } else if (PF.pEnv > 0.f && PF.envUniform) {
+            l = sampleUniformSphere(u2, u3); pl = PF.pEnv * (0.25f * CWP_INV_PI); Le = envRadiance(l); ok = true;
         } else if (PF.pEnv > 0.f) {
             float ue = fminf((us - PF.pSun - PF.pTri) / PF.pEnv, 0.99999994f);
             int y = cdfFind(PF.envMarg, PF.envH, ue);
@@ -265,7 +310,7 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
             float3 lL = mk3(dot(l, tx), dot(l, ty), dot(l, ns));
             float gl = dot(ng, l);
             if (lL.z != 0.f && (gl > 0.f) == (lL.z > 0.f)) {
-                BsdfEval e = bsdfEval(M, woL, lL, eta, PF.gdEnergy, ux1, ux2);
+                BsdfEval e = bsdfEval(M, woL, lL, eta, PF.gdEnergy, ux1, ux2, nrL);
                 float w = (isSun || PF.lightMode == kLightNEE) ? 1.f : misPower(pl, e.pdf);
                 float3 contrib = T * e.f * Le * (fabsf(lL.z) * w / pl);
                 if (contrib.x > 0.f || contrib.y > 0.f || contrib.z > 0.f) {
@@ -277,7 +322,7 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
     }
     // ---- BSDF sampling: continuation ray ----
     float3 wiL, wgt; float pdf;
-    if (!bsdfSample(M, woL, eta, PF.gdEnergy, ux1, ux2, rnd(pix, smp, depth + 1, 4), rnd(pix, smp, depth + 1, 0), rnd(pix, smp, depth + 1, 1), wiL, wgt, pdf)) return;
+    if (!bsdfSample(M, woL, eta, PF.gdEnergy, ux1, ux2, rnd(pix, smp, depth + 1, 4), rnd(pix, smp, depth + 1, 0), rnd(pix, smp, depth + 1, 1), wiL, wgt, pdf, nrL)) return;
     float3 wi = normalize(tx * wiL.x + ty * wiL.y + ns * wiL.z);
     float gi = dot(ng, wi);
     if (gi == 0.f || (gi > 0.f) != (wiL.z > 0.f)) return;
@@ -345,12 +390,27 @@ void WavefrontRenderer::initFull(const SceneBuffers& S) {
     bool sun = S.sunOn, triL = F.nEm > 0 && O_.lightMode != kLightBSDF, envL = F.hasEnv && O_.lightMode != kLightBSDF;
     int nt = (sun ? 1 : 0) + (triL ? 1 : 0) + (envL ? 1 : 0);
     F.pSun = sun ? 1.f / nt : 0.f; F.pTri = triL ? 1.f / nt : 0.f; F.pEnv = envL ? 1.f / nt : 0.f;
-    F.lightMode = O_.lightMode; F.rr = O_.rr; F.rrDepth = O_.rrDepth; F.gdEnergy = O_.gdEnergy;
+    F.lightMode = O_.lightMode; F.rr = O_.rr; F.rrDepth = O_.rrDepth; F.gdEnergy = O_.gdEnergy; F.envUniform = O_.envUniform; F.bumpShadow = O_.bumpShadow;
+    if (!S.mtex.empty()) {   // textures: one uchar4 CUDA array + texture object per image (bilinear, wrap, sRGB decode for colour)
+        std::vector<cudaTextureObject_t> objs;
+        for (const TextureImage& T : S.tex) {
+            cudaChannelFormatDesc cd = cudaCreateChannelDesc<uchar4>(); cudaArray_t arr;
+            CK(cudaMallocArray(&arr, &cd, T.w, T.h));
+            CK(cudaMemcpy2DToArray(arr, 0, 0, T.rgba.data(), (size_t)T.w * 4, (size_t)T.w * 4, T.h, cudaMemcpyHostToDevice));
+            cudaResourceDesc rd; memset(&rd, 0, sizeof rd); rd.resType = cudaResourceTypeArray; rd.res.array.array = arr;
+            cudaTextureDesc td; memset(&td, 0, sizeof td);
+            td.addressMode[0] = td.addressMode[1] = cudaAddressModeWrap; td.filterMode = O_.texNearest ? cudaFilterModePoint : cudaFilterModeLinear;
+            td.readMode = cudaReadModeNormalizedFloat; td.normalizedCoords = 1; td.sRGB = T.srgb ? 1 : 0;
+            cudaTextureObject_t o; CK(cudaCreateTextureObject(&o, &rd, &td, nullptr)); objs.push_back(o);
+        }
+        F.texObj = upload(objs); F.mtex = upload(S.mtex); F.nMtex = (int)S.mtex.size(); F.uvs = upload(S.uvs); F.tans = upload(S.tans);
+    }
     CK(cudaMemcpyToSymbol(PF, &F, sizeof F));
     CK(cudaMalloc(&pAux, NK_ * 4));
     CK(cudaMemGetInfo(&f1m, &tm)); vramMB += (double)(f0m - f1m) / 1048576.0;
-    fprintf(stderr, "full integrator: %zu materials, %d emissive triangles, env %dx%d, light selection sun %.2f tri %.2f env %.2f, mode %s, rr %d, glossy-diffuse energy compensation %d\n",
-            S.mats.size(), F.nEm, F.envW, F.envH, F.pSun, F.pTri, F.pEnv, O_.lightMode == kLightMIS ? "mis" : O_.lightMode == kLightNEE ? "nee" : "bsdf", O_.rr, O_.gdEnergy);
+    fprintf(stderr, "full integrator: %zu materials, %d emissive triangles, env %dx%d (%s sampling), light selection sun %.2f tri %.2f env %.2f, mode %s, rr %d, glossy-diffuse energy compensation %d, %zu textures\n",
+            S.mats.size(), F.nEm, F.envW, F.envH, O_.envUniform ? "uniform" : "importance", F.pSun, F.pTri, F.pEnv,
+            O_.lightMode == kLightMIS ? "mis" : O_.lightMode == kLightNEE ? "nee" : "bsdf", O_.rr, O_.gdEnergy, S.mtex.empty() ? (size_t)0 : S.tex.size());
 }
 
 void WavefrontRenderer::launchTrace(int* q, int n) {

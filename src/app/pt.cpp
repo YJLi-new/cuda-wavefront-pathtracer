@@ -5,6 +5,7 @@
 #include "accel/bvh_layouts.h"
 #include "accel/tri_pack.h"
 #include "core/sampling.h"
+#include "io/assimp_loader.h"
 #include "io/image.h"
 #include "io/mesh_loader.h"
 #include "io/scene_files.h"
@@ -22,14 +23,16 @@
 
 struct Args {
     std::string mesh, camera, out = "out", variant = "bvh2", c2wKey = "c2w_blender_zup", tri = "mt";
-    int fuse = 0, leaf = 4, batch = 64, synthetic = 0, frame = 0, w = 512, h = 512, spp = 256, bounces = 8, persistent = 0, filterBH = 1, smooth = 1, warm = 8, yupToZup = 0, reps = 1, devloop = 0, sort = 0;
+    int fuse = 0, leaf = 4, batch = 64, synthetic = 0, frame = 0, w = 512, h = 512, spp = 256, bounces = 8, persistent = 0, filterBH = 1, smooth = 1, warm = 8, yupToZup = -1, reps = 1, devloop = 0, sort = 0;
     float fx = 0, fy = 0, hfov = 0; unsigned seed = 1000;
     float3 albedo = mk3(-1, 0, 0);
     Lighting light;
     float epsScale = 1e-4f, near = 0.f;
     std::string c2w, lighting;
     std::string materials, env, integrator = "auto", lightSampling = "mis";
-    float envStrength = -1.f, envRot = -1e30f; int rr = 0, rrDepth = 3, gdEnergy = 1;
+    float envStrength = -1.f, envRot = -1e30f; int rr = 0, rrDepth = 3, gdEnergy = 1, bumpShadow = 0;
+    std::string loader = "auto", envSampling = "importance", texFilter = "linear", textures = "base,emission,normal,metallic,roughness";
+    float aperture = -1.f, focusDist = -1.f;   // thin lens (< 0: from the camera file, else pinhole / unused)
 };
 
 static float3 parse3(char** a, int& i) { float3 v = mk3((float)atof(a[i + 1]), (float)atof(a[i + 2]), (float)atof(a[i + 3])); i += 3; return v; }
@@ -48,12 +51,17 @@ static bool parseArgs(int argc, char** argv, Args& A) {
         else if (k == "--sun_to") A.light.sunTo = parse3(argv, i); else if (k == "--sun_rgb") A.light.sunE = parse3(argv, i); else if (k == "--sky") A.light.sky = parse3(argv, i); else if (k == "--albedo") A.albedo = parse3(argv, i);
         else if (k == "--materials") A.materials = argv[++i]; else if (k == "--env") A.env = argv[++i]; else if (k == "--env_strength") A.envStrength = nf(); else if (k == "--env_rot") A.envRot = nf();
         else if (k == "--integrator") A.integrator = argv[++i]; else if (k == "--light_sampling") A.lightSampling = argv[++i]; else if (k == "--rr") A.rr = ni(); else if (k == "--rr_depth") A.rrDepth = ni(); else if (k == "--gd_energy") A.gdEnergy = ni();
+        else if (k == "--bump_shadow") A.bumpShadow = ni(); else if (k == "--tex_filter") A.texFilter = argv[++i]; else if (k == "--textures") A.textures = argv[++i];
+        else if (k == "--loader") A.loader = argv[++i]; else if (k == "--env_sampling") A.envSampling = argv[++i]; else if (k == "--aperture") A.aperture = nf(); else if (k == "--focus_dist") A.focusDist = nf();
         else if (k == "--sun_angle") A.light.sunAngleDeg = nf(); else if (k == "--eps") A.epsScale = nf(); else if (k == "--near") A.near = nf(); else if (k == "--lighting") A.lighting = argv[++i];
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return false; }
     }
     if (A.sort) A.devloop = 1;
     if (A.integrator != "auto" && A.integrator != "legacy" && A.integrator != "full") { fprintf(stderr, "--integrator must be auto, legacy or full\n"); return false; }
     if (A.lightSampling != "mis" && A.lightSampling != "nee" && A.lightSampling != "bsdf") { fprintf(stderr, "--light_sampling must be mis, nee or bsdf\n"); return false; }
+    if (A.loader != "auto" && A.loader != "builtin" && A.loader != "assimp") { fprintf(stderr, "--loader must be auto, builtin or assimp\n"); return false; }
+    if (A.envSampling != "importance" && A.envSampling != "uniform") { fprintf(stderr, "--env_sampling must be importance or uniform\n"); return false; }
+    if (A.texFilter != "linear" && A.texFilter != "nearest") { fprintf(stderr, "--tex_filter must be linear or nearest\n"); return false; }
     return true;
 }
 
@@ -68,10 +76,29 @@ int main(int argc, char** argv) {
         syntheticCamera(c2w); haveC2w = true;
         if (A.hfov == 0 && A.fx == 0) A.hfov = 50.f;
     } else {
-        if (!loadMesh(A.mesh, M)) { fprintf(stderr, "failed to load mesh %s\n", A.mesh.c_str()); return 1; }
-        if (A.yupToZup) { for (auto& v : M.v) v = mk3(v.x, -v.z, v.y); for (auto& n : M.n) n = mk3(n.x, -n.z, n.y); }
+        // loader: built-in OBJ/PLY (dependency-free; default for .obj/.ply) or Assimp (default for everything else)
+        std::string ext = A.mesh.substr(A.mesh.find_last_of('.') + 1); for (auto& ch : ext) ch = (char)tolower((unsigned char)ch);
+        bool useAssimp = A.loader == "assimp" || (A.loader == "auto" && ext != "obj" && ext != "ply");
+        if (!(useAssimp ? loadAssimp(A.mesh, M) : loadMesh(A.mesh, M))) { fprintf(stderr, "failed to load mesh %s (%s loader)\n", A.mesh.c_str(), useAssimp ? "assimp" : "built-in"); return 1; }
+        // glTF is y-up by definition: converted to the z-up world unless --yup_to_zup 0
+        int yup = A.yupToZup >= 0 ? A.yupToZup : (ext == "gltf" || ext == "glb") ? 1 : 0;
+        if (yup) {
+            for (auto& v : M.v) v = mk3(v.x, -v.z, v.y);
+            for (auto& n : M.n) n = mk3(n.x, -n.z, n.y);
+            for (auto& t : M.tan) t = make_float4(t.x, -t.z, t.y, t.w);
+        }
     }
     if (!A.smooth) M.n.clear();
+    {   // --textures: texture kinds to use (the others fall back to the material factors)
+        auto on = [&](const char* k) { return ("," + A.textures + ",").find(std::string(",") + k + ",") != std::string::npos; };
+        for (auto& t : M.mtex) {
+            if (!on("base")) t.baseColor = -1; if (!on("emission")) t.emission = -1; if (!on("normal")) t.normal = -1;
+            if (!on("metallic")) t.metallic = -1; if (!on("roughness")) t.roughness = -1;
+        }
+    }
+    bool textured = false; for (auto& t : M.mtex) textured |= hasTextures(t);
+    if (textured && !M.hasUV()) { fprintf(stderr, "warn: textures without texture coordinates ignored\n"); textured = false; }
+    if (textured && A.albedo.x >= 0) for (auto& t : M.mtex) t.baseColor = -1;   // --albedo replaces textured base colours too
     if (!A.lighting.empty() && !loadLightingFile(A.lighting, A.light, M)) return 1;
     if (A.albedo.x >= 0) for (auto& kd : M.kd) kd = A.albedo;
     if (M.kd.empty()) M.kd.push_back(mk3(0.8f, 0.8f, 0.8f));
@@ -84,7 +111,7 @@ int main(int argc, char** argv) {
     { int maxMat = 0; for (int t : M.fm) if (t > maxMat) maxMat = t;
       size_t nm = std::max(std::max(M.kd.size(), M.mat.size()), (size_t)maxMat + 1);
       for (size_t j = 0; j < nm; j++) { Material m = j < M.mat.size() ? M.mat[j] : lambertMaterial(j < M.kd.size() ? M.kd[j] : mk3(0.8f, 0.8f, 0.8f)); if (A.albedo.x >= 0) m.baseColor = A.albedo; mats.push_back(m); } }
-    bool needFull = A.rr != 0 || !A.light.envMap.empty();
+    bool needFull = A.rr != 0 || !A.light.envMap.empty() || textured;
     for (auto& m : mats) if (!isLambert(m) || isEmissive(m)) needFull = true;
     const bool full = A.integrator == "full" || (A.integrator == "auto" && needFull);
     if (A.integrator == "legacy" && needFull) fprintf(stderr, "warn: --integrator legacy ignores specular/transmissive/emissive materials, the environment map and RR\n");
@@ -98,6 +125,7 @@ int main(int argc, char** argv) {
     if (!A.camera.empty()) {
         if (!loadCameraFile(A.camera, A.c2wKey, A.frame, A.w, A.h, A.fx, A.fy, A.hfov, c2w)) return 1;
         haveC2w = true;
+        loadCameraLens(A.camera, A.aperture, A.focusDist);
     }
     if (!A.c2w.empty()) { std::string s = A.c2w; for (auto& ch : s) if (ch == ',') ch = ' '; const char* p = s.c_str(); char* e; for (int j = 0; j < 16; j++) { c2w[j] = (float)strtod(p, &e); p = e; } haveC2w = true; }
     if (!haveC2w) { fprintf(stderr, "no camera\n"); return 1; }
@@ -105,6 +133,11 @@ int main(int argc, char** argv) {
     if (A.fy == 0) A.fy = A.fx;
     Params H; memset(&H, 0, sizeof H);
     H.cam = makeCamera(c2w, A.fx, A.fy, A.w, A.h);
+    if (A.aperture > 0.f) {
+        if (!(A.focusDist > 0.f)) { fprintf(stderr, "thin lens: --aperture needs --focus_dist (or \"focus_distance\" in the camera file)\n"); return 1; }
+        H.cam.lensR = A.aperture; H.cam.focusD = A.focusDist;
+        fprintf(stderr, "thin lens: aperture radius %.4f, focus distance %.4f\n", A.aperture, A.focusDist);
+    }
     H.sunTo = normalize(A.light.sunTo); H.sunE = A.light.sunE; H.sky = A.light.sky; H.sunCos = cosf(0.5f * A.light.sunAngleDeg * 3.14159265f / 180.f);
     H.maxB = A.bounces; H.seed = A.seed; H.eps = A.epsScale * extent; H.near = A.near; H.hasN = M.hasN() ? 1 : 0; H.filterBH = A.filterBH;
     H.bmin = sb.lo; float3 ex3 = sb.extent(); H.binv = mk3(16.f / fmaxf(ex3.x, 1e-6f), 16.f / fmaxf(ex3.y, 1e-6f), 16.f / fmaxf(ex3.z, 1e-6f));
@@ -142,6 +175,10 @@ int main(int argc, char** argv) {
             S.emCdf.back() = 1.f;
         }
         if (!A.light.envMap.empty()) { if (!buildEnvMap(A.light.envMap, A.light.envStrength, S.env)) return 1; S.envRotDeg = A.light.envRotDeg; }
+        if (textured) {
+            S.mtex = M.mtex; S.mtex.resize(mats.size()); S.tex.swap(M.tex);
+            packAttributes(M, order, S.uvs, S.tans);
+        }
     }
     double bvhS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     size_t nNodes = S.nodes.size() / S.nodeStride, nodeBytes = S.nodes.size() * 16;
@@ -150,7 +187,7 @@ int main(int argc, char** argv) {
     // ---- GPU ----
     int K = A.batch < 1 ? 1 : A.batch;
     if (A.spp % K) { fprintf(stderr, "spp must be a multiple of batch\n"); return 1; }
-    RenderOptions O; O.full = full ? 1 : 0; O.lightMode = A.lightSampling == "nee" ? kLightNEE : A.lightSampling == "bsdf" ? kLightBSDF : kLightMIS; O.rr = A.rr; O.rrDepth = A.rrDepth; O.gdEnergy = A.gdEnergy;
+    RenderOptions O; O.full = full ? 1 : 0; O.lightMode = A.lightSampling == "nee" ? kLightNEE : A.lightSampling == "bsdf" ? kLightBSDF : kLightMIS; O.rr = A.rr; O.rrDepth = A.rrDepth; O.gdEnergy = A.gdEnergy; O.envUniform = A.envSampling == "uniform" ? 1 : 0; O.texNearest = A.texFilter == "nearest" ? 1 : 0; O.bumpShadow = A.bumpShadow;
     O.variant = V; O.tri = TRI; O.fuse = A.fuse; O.persistent = A.persistent; O.devloop = A.devloop; O.sort = A.sort; O.batch = K; O.bounces = A.bounces;
     WavefrontRenderer R; R.init(H, S, O);
     const int N = A.w * A.h;
@@ -161,10 +198,10 @@ int main(int argc, char** argv) {
         FrameStats st; R.render(A.spp, st);
         double tot = st.rays + st.shadowRays;
         printf("{\"rep\":%d,\"variant\":\"bvh%d\",\"tri\":\"%s\",\"persistent\":%d,\"devloop\":%d,\"sort\":%d,\"fuse\":%d,\"leaf\":%d,\"batch\":%d,\"minb\":%d,\"scene\":\"%s\",\"tris\":%zu,\"bvh_nodes\":%zu,\"bvh_bytes\":%zu,\"bvh_depth\":%d,\"bvh_build_s\":%.2f,\"w\":%d,\"h\":%d,\"spp\":%d,\"bounces\":%d,"
-               "\"rays_closest\":%.0f,\"rays_shadow\":%.0f,\"rays_total\":%.0f,\"t_trace_ms\":%.2f,\"t_frame_ms\":%.2f,\"mrays_s_trace\":%.1f,\"mrays_s_e2e\":%.1f,\"avg_path_len\":%.3f,\"vram_MB\":%.0f,\"pt_blocks\":%d,\"gpu\":\"%s\",\"filter\":\"%s\",\"smooth\":%d,\"seed\":%u,\"integrator\":\"%s\"}\n",
+               "\"rays_closest\":%.0f,\"rays_shadow\":%.0f,\"rays_total\":%.0f,\"t_trace_ms\":%.2f,\"t_frame_ms\":%.2f,\"mrays_s_trace\":%.1f,\"mrays_s_e2e\":%.1f,\"avg_path_len\":%.3f,\"vram_MB\":%.0f,\"pt_blocks\":%d,\"gpu\":\"%s\",\"filter\":\"%s\",\"smooth\":%d,\"seed\":%u,\"integrator\":\"%s\",\"lens_r\":%.4f,\"focus_d\":%.4f,\"env_sampling\":\"%s\",\"textures\":%zu}\n",
                r, V, A.tri.c_str(), A.persistent, A.devloop, A.sort, A.fuse, B.leafMax, K, rendererMinBlocks(),
                A.synthetic ? "synthetic" : A.mesh.c_str(), M.f.size(), nNodes, nodeBytes, B.maxDepth, bvhS, A.w, A.h, A.spp, A.bounces,
-               st.rays, st.shadowRays, tot, st.traceMs, st.frameMs, tot / (st.traceMs * 1e3), tot / (st.frameMs * 1e3), st.rays / ((double)N * A.spp), R.vramMB, R.ptBlocks, R.gpuName.c_str(), A.filterBH ? "blackman-harris1.5" : "box", H.hasN, A.seed, full ? (A.lightSampling == "mis" ? "full-mis" : A.lightSampling == "nee" ? "full-nee" : "full-bsdf") : "legacy");
+               st.rays, st.shadowRays, tot, st.traceMs, st.frameMs, tot / (st.traceMs * 1e3), tot / (st.frameMs * 1e3), st.rays / ((double)N * A.spp), R.vramMB, R.ptBlocks, R.gpuName.c_str(), A.filterBH ? "blackman-harris1.5" : "box", H.hasN, A.seed, full ? (A.lightSampling == "mis" ? "full-mis" : A.lightSampling == "nee" ? "full-nee" : "full-bsdf") : "legacy", H.cam.lensR, H.cam.focusD, A.envSampling.c_str(), S.tex.size());
         fflush(stdout);
     }
     std::vector<float4> acc; R.readAccum(acc);

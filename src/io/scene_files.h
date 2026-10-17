@@ -16,3 +16,7 @@ bool loadCameraFile(const std::string& path, const std::string& key, int frame, 
 // emission_color, emission_strength}, ... ]}. Missing keys take OpenPBR defaults. An entry whose "name" matches a mesh
 // material name (OBJ usemtl) is assigned to that id; other entries are assigned by position (entry i -> id i).
 bool loadMaterialsFile(const std::string& path, Mesh& mesh);
+
+// Optional thin-lens keys of the camera file: "aperture_radius" (lens radius, world units) and "focus_distance"
+// (distance of the plane in focus along the view axis). Values already set (>= 0) are kept.
+void loadCameraLens(const std::string& path, float& apertureR, float& focusD);

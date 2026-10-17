@@ -65,3 +65,9 @@ bool loadCameraFile(const std::string& path, const std::string& key, int frame, 
     if (!jsonMatrix(js, key, frame, c2w)) { fprintf(stderr, "no matrix %s in camera file\n", key.c_str()); return false; }
     return true;
 }
+
+void loadCameraLens(const std::string& path, float& apertureR, float& focusD) {
+    std::string js = readTextFile(path); double v;
+    if (apertureR < 0.f && jsonNumber(js, "aperture_radius", v)) apertureR = (float)v;
+    if (focusD < 0.f && jsonNumber(js, "focus_distance", v)) focusD = (float)v;
+}

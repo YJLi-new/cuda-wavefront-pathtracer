@@ -18,7 +18,7 @@ def lum(x): return 0.2126 * x[..., 0] + 0.7152 * x[..., 1] + 0.0722 * x[..., 2]
 
 def masks(sd, w, h):
     cam = json.load(open(os.path.join(sd, "camera.json"))); sp = json.load(open(os.path.join(sd, "spheres.json")))
-    c2w = np.array(cam["c2w_blender_zup"]).reshape(4, 4); fx = cam["fx"]; o = c2w[:3, 3]
+    c2w = np.array(cam["c2w_blender_zup"]).reshape(4, 4); fx = cam["fx"] * w / cam["width"]; o = c2w[:3, 3]   # fx scales with the render width
     def hits(px, py, rad):
         d = np.stack([(px - w / 2) / fx, -(py - h / 2) / fx, -np.ones_like(px)], -1) @ c2w[:3, :3].T
         d /= np.linalg.norm(d, axis=-1, keepdims=True)

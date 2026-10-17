@@ -19,6 +19,9 @@ struct RenderOptions {
     int full = 0;         // 1: full material integrator (always fused; persistent/devloop/sort are legacy-only)
     int lightMode = kLightMIS; int rr = 0, rrDepth = 3;
     int gdEnergy = 1;     // glossy-diffuse energy compensation (albedo scaling); 0 = plain Fresnel-weighted mix
+    int envUniform = 0;   // environment light sampling: 0 importance (luminance x sin theta), 1 uniform sphere
+    int texNearest = 0;   // texture filtering: 0 bilinear, 1 nearest texel
+    int bumpShadow = 0;   // bump-terminator shadowing term (Chiang et al. 2019) on normal-mapped diffuse lobes
 };
 
 // host copies of the scene, uploaded once by init()
@@ -30,6 +33,8 @@ struct SceneBuffers {
     std::vector<Material> mats;
     std::vector<float> triLightPdf; std::vector<int> emTri; std::vector<float> emCdf;
     EnvMapHost env; float envRotDeg = 0.f; bool sunOn = true;
+    // textures (full integrator; empty when no material is textured), see render/params.h
+    std::vector<MaterialTextures> mtex; std::vector<TextureImage> tex; std::vector<float4> uvs, tans;
 };
 
 struct FrameStats { double rays = 0, shadowRays = 0, traceMs = 0, frameMs = 0; };

@@ -25,12 +25,42 @@ add_library(cwp_core INTERFACE)
 target_include_directories(cwp_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CUDAToolkit_INCLUDE_DIRS})
 
 # scene: mesh, camera, lighting, procedural scenes
-add_library(cwp_scene STATIC src/scene/camera.cpp src/scene/synthetic.cpp src/scene/environment.cpp src/io/hdr_image.cpp)
+add_library(cwp_scene STATIC src/scene/camera.cpp src/scene/synthetic.cpp src/scene/environment.cpp src/scene/tangents.cpp src/io/hdr_image.cpp)
 target_link_libraries(cwp_scene PUBLIC cwp_core)
 
 # io: mesh loaders, camera/lighting files, image writers
-add_library(cwp_io STATIC src/io/mesh_loader.cpp src/io/json.cpp src/io/scene_files.cpp src/io/image.cpp)
+add_library(cwp_io STATIC src/io/mesh_loader.cpp src/io/assimp_loader.cpp src/io/json.cpp src/io/scene_files.cpp src/io/image.cpp)
 target_link_libraries(cwp_io PUBLIC cwp_scene)
+
+# optional Assimp model loading (obj/ply/fbx/gltf/glb) + stb_image textures, fetched at configure time and pinned:
+#   Assimp v5.4.3 (official release tag, BSD-3-Clause), stb at a fixed commit (stb has no release tags; MIT / public domain).
+# -DCWP_WITH_ASSIMP=OFF builds without network access; the built-in OBJ/PLY loaders remain.
+option(CWP_WITH_ASSIMP "Model loading through Assimp + textures through stb_image (FetchContent)" ON)
+if(CWP_WITH_ASSIMP)
+  include(FetchContent)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)   # Assimp's bundled zlib still declares a pre-3.5 minimum
+  endif()
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+  set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
+  set(ASSIMP_NO_EXPORT ON CACHE BOOL "" FORCE)
+  set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+  set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
+  set(ASSIMP_BUILD_DRACO OFF CACHE BOOL "" FORCE)
+  set(ASSIMP_INJECT_DEBUG_POSTFIX OFF CACHE BOOL "" FORCE)
+  set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+  foreach(fmt OBJ PLY FBX GLTF)
+    set(ASSIMP_BUILD_${fmt}_IMPORTER ON CACHE BOOL "" FORCE)
+  endforeach()
+  FetchContent_Declare(assimp GIT_REPOSITORY https://github.com/assimp/assimp.git GIT_TAG v5.4.3 GIT_SHALLOW TRUE)
+  FetchContent_Declare(stb GIT_REPOSITORY https://github.com/nothings/stb.git GIT_TAG 2c980bb59875b0d32144a71867fbdebb2f77cd20)
+  FetchContent_MakeAvailable(assimp stb)
+  target_compile_definitions(cwp_io PRIVATE CWP_HAVE_ASSIMP=1)
+  target_include_directories(cwp_io PRIVATE ${stb_SOURCE_DIR})
+  target_link_libraries(cwp_io PRIVATE assimp)
+endif()
 
 # accel: CPU BVH builder and GPU layouts (device traversal lives in accel/traverse.cuh)
 add_library(cwp_accel STATIC src/accel/bvh_builder.cpp src/accel/bvh_layouts.cpp src/accel/tri_pack.cpp)

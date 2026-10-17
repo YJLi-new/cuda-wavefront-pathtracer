@@ -2,6 +2,8 @@
 # build.sh - thin wrapper around CMake. Needs the CUDA toolkit (nvcc) and CMake >= 3.22, not a GPU.
 #   ARCH=sm_90 ./build.sh          # default: Hopper (H100 / H800). Use e.g. sm_80, sm_86, sm_89 for other GPUs.
 #   VARIANTS=1 ./build.sh          # also build the register-cap variants used in the ablation study
+#   ASSIMP=OFF ./build.sh          # without Assimp/stb (no network access needed; built-in OBJ/PLY loaders only)
+#   JOBS=8 ./build.sh              # parallel compile jobs (default: all cores)
 # Outputs: build/pt (recommended: __launch_bounds__(128,12), <= 40 registers/thread on sm_90)
 #          build/pt_nocap, build/pt_mb16 (only with VARIANTS=1)
 # Without CMake it falls back to one direct nvcc call per binary.
@@ -13,8 +15,8 @@ mkdir -p build
 echo "nvcc: ${NVCC}  arch: ${ARCH}"
 if command -v cmake > /dev/null; then
   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="${NVCC}" -DCMAKE_CUDA_ARCHITECTURES="${ARCH#sm_}" \
-        -DCWP_VARIANTS=$([ "${VARIANTS:-0}" = "1" ] && echo ON || echo OFF) > build/cmake.log 2>&1 || { cat build/cmake.log; exit 1; }
-  J=$(nproc 2> /dev/null || echo 4)
+        -DCWP_VARIANTS=$([ "${VARIANTS:-0}" = "1" ] && echo ON || echo OFF) -DCWP_WITH_ASSIMP="${ASSIMP:-ON}" > build/cmake.log 2>&1 || { cat build/cmake.log; exit 1; }
+  J=${JOBS:-$(nproc 2> /dev/null || echo 4)}
   cmake --build build -j "$J" --target pt > build/pt.log 2>&1 || { cat build/pt.log; exit 1; }
   cmake --build build -j "$J" > build/all.log 2>&1 || { cat build/all.log; exit 1; }
 else
