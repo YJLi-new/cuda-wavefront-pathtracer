@@ -51,9 +51,20 @@ public:
     // instanced scenes, before each frame: instance records, world-space emissive triangles + their power CDF and the
     // per-material light pdf; rebuilds the TLAS on the GPU (H-PLOC) and records its time in tlasMs
     void setInstances(const std::vector<DevInstance>& inst, const std::vector<float4>& emTris, const std::vector<float>& emCdf, const std::vector<float>& matLightPdf);
-    // renders spp samples per pixel (multiple of batch) into a cleared accumulation buffer
-    void render(int spp, FrameStats& st);
+    // renders spp samples per pixel (multiple of batch) with sample indices [sBase, sBase + spp) into the accumulation
+    // buffer, cleared first unless clear = false. Progressive accumulation: N calls with sBase = 0, K, 2K, ... (K = batch)
+    // trace the same samples as one call with N * K spp.
+    void render(int spp, FrameStats& st, int sBase = 0, bool clear = true);
     void readAccum(std::vector<float4>& acc) const;   // per-pixel radiance sums (divide by spp)
+    const float4* accumDevice() const { return accum; }   // the same sums on the device (w * h float4)
+
+    // runtime updates for the interactive viewer (synchronize, re-upload; effective from the next render()):
+    void setParams(const Params& H);                     // camera, sun, sky, bounce limit (maxB <= the init value), seed
+    void setMaterials(const std::vector<Material>& m);   // same material count; emission must not change (light tables)
+    // full integrator: environment texels (radiance * strength, same size; nullptr keeps them), environment rotation
+    // about z in degrees, sun on/off (light-type selection probabilities)
+    void setEnvironment(const std::vector<float4>* texels, float envRotDeg, bool sunOn);
+    const Params& params() const { return H_; }
 
     double vramMB = 0, tlasMs = 0; int ptBlocks = 0; std::string gpuName;
 
@@ -62,8 +73,8 @@ private:
     void launchShadow(int n);
     cudaEvent_t nextEvent();
     void initFull(const SceneBuffers& S);
-    void renderFull(int spp, FrameStats& st);
-    void enqueueFullPasses(int spp);
+    void renderFull(int spp, FrameStats& st, int sBase, bool clear);
+    void enqueueFullPasses(int spp, int sBase);
     void launchFullTrace(int* q, const int* nPtr, int n, int* qOut, int* qOutCnt, int* sCnt, int* fetch, int smp);
     void launchFullShadow(const int* nPtr, int n, int* fetch);
 
@@ -74,7 +85,8 @@ private:
     int* qOut_ = nullptr; int smp_ = 0;
     std::vector<cudaEvent_t> evs; size_t evUsed = 0; cudaEvent_t f0, f1;
     // full integrator: stream, CUDA graph, persistent grid sizes, instanced-scene buffers
-    cudaStream_t st_ = nullptr; cudaGraphExec_t gexec_ = nullptr; int gSpp_ = -1;
+    cudaStream_t st_ = nullptr; cudaGraphExec_t gexec_ = nullptr; int gSpp_ = -1, gBase_ = 0;
+    Params H_; FullParams F_; int nMats_ = 0; bool sunOn_ = true;   // host copies of the __constant__ parameters
     int ptTraceBlocks_ = 0, ptShadowBlocks_ = 0, gridCap_ = 0;
     int nInst_ = 0, nEmInst_ = 0; DevInstance* dInst = nullptr; float4 *dTlas = nullptr, *dBoxLo = nullptr, *dBoxHi = nullptr, *dMeshBox = nullptr, *dEmTris = nullptr;
     float *dEmCdf = nullptr, *dMatLightPdf = nullptr; HplocBuilder hploc_; cudaEvent_t tl0, tl1;

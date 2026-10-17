@@ -78,17 +78,66 @@ function(cwp_add_render name minb)
   endif()
 endfunction()
 
+# app: command-line options + scene setup shared by the batch renderer and the viewer
+add_library(cwp_app STATIC src/app/scene_setup.cpp)
+target_link_libraries(cwp_app PUBLIC cwp_io cwp_accel cwp_scene)
+
 # app: batch renderer CLI
 function(cwp_add_pt name minb)
   cwp_add_render(${name}_render ${minb})
   add_executable(${name} src/app/pt.cpp)
-  target_link_libraries(${name} PRIVATE ${name}_render cwp_accel cwp_io cwp_scene)
+  target_link_libraries(${name} PRIVATE ${name}_render cwp_app cwp_accel cwp_io cwp_scene)
 endfunction()
 
 cwp_add_pt(pt ${CWP_MINB})
 if(CWP_VARIANTS)
   cwp_add_pt(pt_nocap 0)
   cwp_add_pt(pt_mb16 16)
+endif()
+
+# interactive viewer (optional): GLFW 3.4 (zlib), GLEW 2.2.0 (BSD-3 / MIT; release tarball with generated sources),
+# Dear ImGui v1.91.9b (MIT), tinyfiledialogs (zlib; SourceForge git, no release tags -> fixed commit), all fetched at
+# configure time. Linux: GLFW's X11 backend (dev headers of libx11, libxrandr, libxinerama, libxcursor, libxi, libxext and
+# OpenGL); -DCWP_VIEWER_WAYLAND=ON also builds the Wayland backend (needs wayland-scanner, libwayland-dev, libxkbcommon-dev).
+option(CWP_WITH_VIEWER "Build the interactive viewer (GLFW + GLEW + Dear ImGui + tinyfiledialogs, FetchContent)" OFF)
+if(CWP_WITH_VIEWER)
+  enable_language(C)
+  if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)   # URL downloads: extracted files get the extraction time
+  endif()
+  include(FetchContent)
+  find_package(OpenGL REQUIRED)
+  option(CWP_VIEWER_WAYLAND "Viewer: also build GLFW's Wayland backend (Linux)" OFF)
+  set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_WAYLAND ${CWP_VIEWER_WAYLAND} CACHE BOOL "" FORCE)
+  FetchContent_Declare(glfw GIT_REPOSITORY https://github.com/glfw/glfw.git GIT_TAG 3.4 GIT_SHALLOW TRUE)
+  FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.9b GIT_SHALLOW TRUE SOURCE_SUBDIR cwp-no-cmake)
+  FetchContent_Declare(tinyfiledialogs GIT_REPOSITORY https://git.code.sf.net/p/tinyfiledialogs/code GIT_TAG db67fa7e6f5d893551079c5dd0b1ddd1faeeb8b7 SOURCE_SUBDIR cwp-no-cmake)
+  FetchContent_Declare(glew URL https://github.com/nigels-com/glew/releases/download/glew-2.2.0/glew-2.2.0.tgz SOURCE_SUBDIR cwp-no-cmake)
+  FetchContent_MakeAvailable(glfw imgui tinyfiledialogs glew)
+
+  add_library(cwp_glew STATIC ${glew_SOURCE_DIR}/src/glew.c)
+  target_include_directories(cwp_glew SYSTEM PUBLIC ${glew_SOURCE_DIR}/include)
+  target_compile_definitions(cwp_glew PUBLIC GLEW_STATIC GLEW_NO_GLU)
+  target_link_libraries(cwp_glew PUBLIC OpenGL::GL)
+
+  add_library(cwp_imgui STATIC ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
+              ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+  target_include_directories(cwp_imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+  target_link_libraries(cwp_imgui PUBLIC glfw OpenGL::GL)
+
+  add_library(cwp_tinyfd STATIC ${tinyfiledialogs_SOURCE_DIR}/tinyfiledialogs.c)
+  target_include_directories(cwp_tinyfd SYSTEM PUBLIC ${tinyfiledialogs_SOURCE_DIR})
+  if(WIN32)
+    target_link_libraries(cwp_tinyfd PUBLIC comdlg32 ole32)
+  endif()
+
+  # same render library (and register cap) as pt; the display kernel is built without --use_fast_math
+  add_executable(viewer src/app/viewer.cpp src/app/display.cu)
+  target_link_libraries(viewer PRIVATE pt_render cwp_app cwp_accel cwp_io cwp_scene cwp_imgui cwp_glew cwp_tinyfd glfw OpenGL::GL CUDA::cudart_static)
 endif()
 
 # tests: CPU checks of the device BSDF code (chi-square sampling tests, white furnace)

@@ -477,7 +477,7 @@ void WavefrontRenderer::init(const Params& H, const SceneBuffers& S, const Rende
     dTrav = TRI_ == 1 ? dWoop : dTris;
     if (!S.nrm.empty()) { CK(cudaMalloc(&dNrm, S.nrm.size() * 16)); CK(cudaMemcpy(dNrm, S.nrm.data(), S.nrm.size() * 16, cudaMemcpyHostToDevice)); }
     CK(cudaMalloc(&dAlb, S.albedo.size() * sizeof(float3))); CK(cudaMemcpy(dAlb, S.albedo.data(), S.albedo.size() * sizeof(float3), cudaMemcpyHostToDevice));
-    CK(cudaMemcpyToSymbol(P, &H, sizeof H));
+    CK(cudaMemcpyToSymbol(P, &H, sizeof H)); H_ = H;
     N_ = H.cam.w * H.cam.h; K_ = O.batch < 1 ? 1 : O.batch; NK_ = (size_t)N_ * K_;
     DEPTHS_ = O.bounces + 2;
     const size_t NK = NK_;
@@ -546,7 +546,7 @@ void WavefrontRenderer::initFull(const SceneBuffers& S) {
         }
         F.texObj = upload(objs); F.mtex = upload(S.mtex); F.nMtex = (int)S.mtex.size(); F.uvs = upload(S.uvs); F.tans = upload(S.tans);
     }
-    CK(cudaMemcpyToSymbol(PF, &F, sizeof F));
+    CK(cudaMemcpyToSymbol(PF, &F, sizeof F)); F_ = F; nMats_ = (int)S.mats.size(); sunOn_ = S.sunOn;
     CK(cudaMalloc(&pAux, NK_ * 4));
     if (INST_) CK(cudaMalloc(&hitI, NK_ * 4));
     if (O_.persistent && V_ != 4) {
@@ -623,9 +623,9 @@ void WavefrontRenderer::launchFullShadow(const int* nPtr, int n, int* fetch) {
 // device-driven passes (no host readback): queue counts live in cnt + 8 * depth ([0] queue, [1] shadow queue,
 // [2] / [3] persistent fetch counters, [8] = next depth's queue); every bounce is launched with a fixed grid.
 // This is the sequence captured into the CUDA graph.
-void WavefrontRenderer::enqueueFullPasses(int spp) {
+void WavefrontRenderer::enqueueFullPasses(int spp, int sBase) {
     const int K = K_, DEPTHS = DEPTHS_; const size_t NK = NK_;
-    for (int s = 0; s < spp; s += K) {
+    for (int s = sBase; s < sBase + spp; s += K) {
         k_raygen<<<(int)((NK + 255) / 256), 256, 0, st_>>>(pO, pD, pT, pDepth, q0, s, K);
         CK(cudaMemsetAsync(pAux, 0, NK * 4, st_));
         CK(cudaMemsetAsync(cnt, 0, (DEPTHS + 1) * 8 * 4, st_));
@@ -641,21 +641,23 @@ void WavefrontRenderer::enqueueFullPasses(int spp) {
     }
 }
 
-void WavefrontRenderer::renderFull(int spp, FrameStats& S) {
+void WavefrontRenderer::renderFull(int spp, FrameStats& S, int sBase, bool clear) {
     const int N = N_, K = K_, DEPTHS = DEPTHS_; const size_t NK = NK_;
-    CK(cudaMemsetAsync(accum, 0, (size_t)N * 16, st_)); CK(cudaMemsetAsync(dtot, 0, 16, st_)); evUsed = 0;
+    if (clear) CK(cudaMemsetAsync(accum, 0, (size_t)N * 16, st_));
+    CK(cudaMemsetAsync(dtot, 0, 16, st_)); evUsed = 0;
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> pairs;
     CK(cudaEventRecord(f0, st_));
     if (O_.graph) {
-        if (!gexec_ || gSpp_ != spp) {
+        if (!gexec_ || gSpp_ != spp || gBase_ != sBase) {   // the sample range is baked into the captured launches
             if (gexec_) CK(cudaGraphExecDestroy(gexec_));
-            cudaGraph_t g; CK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal)); enqueueFullPasses(spp); CK(cudaStreamEndCapture(st_, &g));
-            CK(cudaGraphInstantiate(&gexec_, g, 0)); size_t nn = 0; CK(cudaGraphGetNodes(g, nullptr, &nn)); CK(cudaGraphDestroy(g)); gSpp_ = spp;
-            fprintf(stderr, "CUDA graph: %zu nodes for %d spp (%d passes x %d bounces)\n", nn, spp, (spp + K - 1) / K, DEPTHS);
+            cudaGraph_t g; CK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal)); enqueueFullPasses(spp, sBase); CK(cudaStreamEndCapture(st_, &g));
+            CK(cudaGraphInstantiate(&gexec_, g, 0)); size_t nn = 0; CK(cudaGraphGetNodes(g, nullptr, &nn)); CK(cudaGraphDestroy(g));
+            if (gSpp_ != spp) fprintf(stderr, "CUDA graph: %zu nodes for %d spp (%d passes x %d bounces)\n", nn, spp, (spp + K - 1) / K, DEPTHS);
+            gSpp_ = spp; gBase_ = sBase;
         }
         CK(cudaGraphLaunch(gexec_, st_));
     } else {
-        for (int s = 0; s < spp; s += K) {
+        for (int s = sBase; s < sBase + spp; s += K) {
             k_raygen<<<(int)((NK + 255) / 256), 256, 0, st_>>>(pO, pD, pT, pDepth, q0, s, K);
             CK(cudaMemsetAsync(pAux, 0, NK * 4, st_));
             int* qIn = q0; int* qOut = q1; int n = (int)NK;
@@ -679,13 +681,14 @@ void WavefrontRenderer::renderFull(int spp, FrameStats& S) {
 
 cudaEvent_t WavefrontRenderer::nextEvent() { if (evUsed == evs.size()) { cudaEvent_t e; CK(cudaEventCreate(&e)); evs.push_back(e); } return evs[evUsed++]; }
 
-void WavefrontRenderer::render(int spp, FrameStats& S) {
-    if (O_.full) { renderFull(spp, S); return; }
+void WavefrontRenderer::render(int spp, FrameStats& S, int sBase, bool clear) {
+    if (O_.full) { renderFull(spp, S, sBase, clear); return; }
     const int N = N_, K = K_, DEPTHS = DEPTHS_; const size_t NK = NK_;
-    CK(cudaMemset(accum, 0, N * 16)); CK(cudaMemset(dtot, 0, 16)); evUsed = 0;
+    if (clear) CK(cudaMemset(accum, 0, N * 16));
+    CK(cudaMemset(dtot, 0, 16)); evUsed = 0;
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> pairs;
     CK(cudaEventRecord(f0));
-    for (int s = 0; s < spp; s += K) {
+    for (int s = sBase; s < sBase + spp; s += K) {
         k_raygen<<<(int)((NK + 255) / 256), 256>>>(pO, pD, pT, pDepth, q0, s, K);
         int* qIn = q0; int* qOut = q1; int* qS = q2; int n = (int)NK;
         if (!O_.devloop) {
@@ -735,6 +738,30 @@ void WavefrontRenderer::render(int spp, FrameStats& S) {
     for (auto& pr : pairs) { CK(cudaEventElapsedTime(&ms, pr.first, pr.second)); S.traceMs += ms; }
     if (O_.devloop) { unsigned long long tot[2]; CK(cudaMemcpy(tot, dtot, 16, cudaMemcpyDeviceToHost)); S.rays = (double)tot[0]; S.shadowRays = (double)tot[1]; }
     CK(cudaGetLastError());
+}
+
+// ---------------- runtime updates (interactive viewer); called between render() calls ----------------
+void WavefrontRenderer::setParams(const Params& H) { CK(cudaDeviceSynchronize()); H_ = H; CK(cudaMemcpyToSymbol(P, &H, sizeof H)); }
+
+void WavefrontRenderer::setMaterials(const std::vector<Material>& mats) {
+    CK(cudaDeviceSynchronize());
+    std::vector<float3> alb; for (const Material& m : mats) alb.push_back(m.baseColor);
+    if (!alb.empty()) CK(cudaMemcpy(dAlb, alb.data(), alb.size() * sizeof(float3), cudaMemcpyHostToDevice));
+    if (O_.full && F_.mats && (int)mats.size() == nMats_) CK(cudaMemcpy((void*)F_.mats, mats.data(), mats.size() * sizeof(Material), cudaMemcpyHostToDevice));
+}
+
+void WavefrontRenderer::setEnvironment(const std::vector<float4>* texels, float envRotDeg, bool sunOn) {
+    if (!O_.full) return;
+    CK(cudaDeviceSynchronize());
+    if (texels && F_.hasEnv && texels->size() == (size_t)F_.envW * F_.envH) CK(cudaMemcpy((void*)F_.envTex, texels->data(), texels->size() * 16, cudaMemcpyHostToDevice));
+    F_.envRot = envRotDeg * 3.14159265f / 180.f;
+    if (sunOn != sunOn_) {   // light-type selection probabilities, same rule as initFull
+        sunOn_ = sunOn;
+        bool triL = F_.nEm > 0 && O_.lightMode != kLightBSDF, envL = F_.hasEnv && O_.lightMode != kLightBSDF;
+        int nt = (sunOn ? 1 : 0) + (triL ? 1 : 0) + (envL ? 1 : 0);
+        F_.pSun = sunOn ? 1.f / nt : 0.f; F_.pTri = triL ? 1.f / nt : 0.f; F_.pEnv = envL ? 1.f / nt : 0.f;
+    }
+    CK(cudaMemcpyToSymbol(PF, &F_, sizeof F_));
 }
 
 void WavefrontRenderer::readAccum(std::vector<float4>& acc) const { acc.resize(N_); CK(cudaMemcpy(acc.data(), accum, (size_t)N_ * 16, cudaMemcpyDeviceToHost)); }
