@@ -17,7 +17,7 @@ static void loadMTL(const std::string& path, Mesh& m, std::map<std::string, int>
     char line[1024]; int cur = -1;
     while (fgets(line, sizeof line, fp)) {
         if (strncmp(line, "newmtl", 6) == 0) {
-            char name[512]; if (sscanf(line + 6, "%511s", name) == 1) { cur = (int)m.kd.size(); mats[name] = cur; m.kd.push_back(mk3(0.8f, 0.8f, 0.8f)); }
+            char name[512]; if (sscanf(line + 6, "%511s", name) == 1) { cur = (int)m.kd.size(); mats[name] = cur; m.kd.push_back(mk3(0.8f, 0.8f, 0.8f)); m.matName.resize(m.kd.size()); m.matName[cur] = name; }
         } else if (cur >= 0 && strncmp(line, "Kd", 2) == 0) {
             float r, g, b; if (sscanf(line + 2, "%f %f %f", &r, &g, &b) == 3) m.kd[cur] = mk3(r, g, b);
         }

@@ -25,7 +25,7 @@ add_library(cwp_core INTERFACE)
 target_include_directories(cwp_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CUDAToolkit_INCLUDE_DIRS})
 
 # scene: mesh, camera, lighting, procedural scenes
-add_library(cwp_scene STATIC src/scene/camera.cpp src/scene/synthetic.cpp)
+add_library(cwp_scene STATIC src/scene/camera.cpp src/scene/synthetic.cpp src/scene/environment.cpp src/io/hdr_image.cpp)
 target_link_libraries(cwp_scene PUBLIC cwp_core)
 
 # io: mesh loaders, camera/lighting files, image writers
@@ -58,4 +58,13 @@ cwp_add_pt(pt ${CWP_MINB})
 if(CWP_VARIANTS)
   cwp_add_pt(pt_nocap 0)
   cwp_add_pt(pt_mb16 16)
+endif()
+
+# tests: CPU checks of the device BSDF code (chi-square sampling tests, white furnace)
+option(CWP_TESTS "Build the CPU BSDF tests (cwp_bsdf_tests)" ON)
+if(CWP_TESTS)
+  enable_testing()
+  add_executable(cwp_bsdf_tests tests/bsdf_tests.cpp)
+  target_link_libraries(cwp_bsdf_tests PRIVATE cwp_core)
+  add_test(NAME bsdf COMMAND cwp_bsdf_tests)
 endif()

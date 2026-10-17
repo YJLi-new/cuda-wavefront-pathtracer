@@ -197,6 +197,13 @@ BATCH=64 scripts/bench_synthetic.sh
 | `--seed`、`--warm`、`--reps` | 1000、8、1 | 随机种子、预热 spp、计时帧数 |
 | `--persistent`、`--devloop`、`--sort` | 0 | 消融中的实验变体，都更慢 |
 | `--out PREFIX` | out | 输出路径前缀 |
+| `--materials PATH` | — | 材质 JSON（OpenPBR 子集），见下文 |
+| `--env PATH` | — | 等距柱状投影的 Radiance `.hdr` 环境贴图，替代常数天空 |
+| `--env_strength S`, `--env_rot DEG` | 1, 0 | 环境辐亮度倍数，以及绕世界 z 轴的旋转 |
+| `--integrator auto\|legacy\|full` | auto | `legacy` 是基准测试用的 Lambert + 太阳 + 天空快速路径；`full` 加上材质系统、自发光三角形、环境贴图和 MIS；`auto` 只在场景需要时选 `full` |
+| `--light_sampling mis\|nee\|bsdf` | mis | 完整积分器中自发光体与环境的采样方式；`mis` 用幂启发式组合光源采样与 BSDF 采样 |
+| `--rr 0\|1`, `--rr_depth N` | 0, 3 | 完整积分器：从深度 N 起的俄罗斯轮盘（默认关闭） |
+| `--gd_energy 0\|1` | 1 | 完整积分器：glossy-diffuse 混合的能量补偿（反照率缩放）；0 为单纯按 Fresnel 加权的混合 |
 
 ### 输入格式
 
@@ -217,13 +224,31 @@ BATCH=64 scripts/bench_synthetic.sh
   "albedo_rgb_linear_by_material_index": [[0.5, 0.5, 0.5], [0.8, 0.35, 0.22]] }
 ```
 
-若提供 `albedo_rgb_linear_by_material_index`，它会替换网格自带的材质颜色，按 OBJ 材质顺序或 PLY 的 `material_index` 索引。
+若提供 `albedo_rgb_linear_by_material_index`，它会替换网格自带的材质颜色，按 OBJ 材质顺序或 PLY 的 `material_index` 索引。光照文件还可以设置 `"env_map"`、`"env_strength"` 和 `"env_rotation_deg"`。
+
+**材质**：`--materials` 读入一组 OpenPBR 风格的参数，每个键都可省略。`name` 与 OBJ `usemtl` 名称相同的条目赋给该材质；其余条目按位置赋值（第 *i* 项对应 PLY 的 `material_index` *i*）。
+
+```json
+{ "materials": [
+  { "name": "gold", "base_color": [0.95, 0.64, 0.54], "metallic": 1.0, "roughness": 0.3, "specular_color": [1, 1, 1] },
+  { "name": "glass", "base_color": [1, 1, 1], "transmission": 1.0, "roughness": 0.1, "ior": 1.5 },
+  { "name": "paint", "base_color": [0.2, 0.4, 0.8], "roughness": 0.4, "ior": 1.5, "specular_weight": 1.0 },
+  { "name": "lamp", "base_color": [0.5, 0.5, 0.5], "emission_color": [1.0, 0.6, 0.3], "emission_strength": 3.0 } ] }
+```
+
+| 基底 | 条件 | 模型 |
+|---|---|---|
+| 导体 | `metallic` = 1 | GGX 微表面反射，Schlick Fresnel 加 F82 tint 项（Kutz et al. 2021），F0 = `base_color`，tint = `specular_color` |
+| 透射介电 | `transmission` = 1 | 粗糙 GGX 反射与折射（Walter et al. 2007），精确 Fresnel，折射按 `base_color` 着色，无体散射 |
+| glossy-diffuse | 其余情况 | GGX 介电镜面（`ior`、`specular_weight`）叠在 Lambert `base_color` 波瓣上；这是非物理混合，漫反射权重为 1 −（镜面反照率） |
+
+`metallic` 与 `transmission` 取小数时三种基底线性混合。`roughness` 为 *r* 时 GGX α = *r*²。微表面波瓣按可见法线分布采样（球冠法，Heitz 2018；Dupuy 与 Benyoub 2023），漫反射按余弦分布采样。自发光为双面。自发光三角形按功率作为面光源采样。每个路径顶点取一个光源样本：太阳、自发光三角形或环境贴图像素（按亮度 × sin θ）。这个光源样本与 BSDF 样本用幂启发式组合（Veach 1997）。没有镜面、金属、透射和自发光的材质就是纯 Lambert，仍走原来的 legacy 内核，不受影响。
 
 ## 局限
 
-- **材质**：只有 Lambert，每个材质一个反照率。没有纹理，也没有光泽、镜面或透射 BSDF。
-- **光源**：一个太阳加常数天空。没有环境贴图重要性采样，也没有面光源、点光源或自发光。
-- **采样**：没有俄罗斯轮盘、自适应采样或降噪。
+- **材质**：只有 OpenPBR 子集（导体、粗糙介电、glossy-diffuse、自发光）。暂时没有纹理，也没有清漆、绒面、次表面、薄膜或体积。单次散射 GGX 在高粗糙度下会损失能量。上面的基准数字用的是 legacy Lambert 路径。
+- **光源**：太阳、常数天空或等距柱状 `.hdr` 环境贴图，以及自发光三角形。没有点光源和聚光灯。太阳只通过光源采样计入，所以透过玻璃或在镜面里看不到太阳。
+- **采样**：俄罗斯轮盘可选，默认关闭。没有自适应采样和降噪。
 - **几何**：只支持静态三角网格。BVH 在启动时由 CPU 单线程构建，这部分不计入帧时间。
 - **可移植性**：可以为 nvcc 支持的任何架构编译，但只在 Hopper（sm_90）上调优和验证过。
 - **加速比的适用范围**：只在一个开阔户外、浅路径、纯漫反射材质的场景上测过。见[性能](#性能)下的说明。
@@ -234,10 +259,11 @@ BATCH=64 scripts/bench_synthetic.sh
 src/core/         float3 工具函数、哈希随机数、采样变换（主机与设备共用，仅头文件）
 src/scene/        网格、相机与光照类型；合成场景生成
 src/accel/        分箱 SAH BVH2 构建器；BVH2/BVH4/压缩 8 叉 BVH 的 GPU 布局；三角形打包；设备端遍历
-src/render/       wavefront 内核（光线生成、融合遍历着色、着色、阴影）与主机驱动
+src/render/       wavefront 内核（光线生成、融合遍历着色、着色、阴影、完整材质的融合遍历着色）、BSDF 与主机驱动
 src/io/           OBJ/MTL 与 PLY 读取；相机与光照 JSON；PNG 与 PFM 写出
 src/app/pt.cpp    批渲染命令行程序（build/pt）
 tools/psnr.py     在色调映射后的 sRGB 上算 PSNR（支持 PNG、PFM、EXR）
+tests/            CPU 上的 BSDF 测试（卡方、白炉）、材质球场景、Cycles 参考渲染脚本、MIS 一致性检查
 scripts/          基准预设
 examples/         小型 OBJ 示例场景及相机、光照 JSON
 CMakeLists.txt    构建（每个模块一个静态库）

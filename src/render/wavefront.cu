@@ -3,13 +3,16 @@
 // Options: BVH2 / BVH4 / compressed BVH8 traversal (accel/traverse.cuh); Moller-Trumbore or Woop triangles;
 // fused trace+shade; host-driven loop (one sync per bounce) or experimental device-driven loop (persistent-style
 // kernels reading queue counts from device memory) with optional counting-sort binning of bounce rays by
-// (direction octant, Morton code of origin). Shading: Lambert + sun next-event estimation + constant sky.
+// (direction octant, Morton code of origin). Legacy shading: Lambert + sun next-event estimation + constant sky.
+// Full integrator (k_trace_shade_full): OpenPBR-subset materials, area lights, environment map, MIS, RR.
 #include "render/renderer.h"
 #include "accel/traverse.cuh"
 #include "core/rng.h"
 #include "core/sampling.h"
+#include "render/bsdf.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 #ifndef MINB
@@ -154,6 +157,136 @@ __global__ void k_scan(int* hist) { // single block, 1024 threads, kSortBins bin
 __global__ void k_scatter(const int* __restrict__ q, const int* nPtr, int* fetch, const unsigned* __restrict__ keys, int* cursor, int* qOut) { WARP_LOOP(nPtr, fetch, k) { int i = q[k]; int pos = atomicAdd(&cursor[keys[i]], 1); qOut[pos] = i; } }
 __global__ void k_sumcounts(const int* cnt, int depths, unsigned long long* tot) { if (threadIdx.x == 0) { unsigned long long a = 0, b = 0; for (int d = 0; d < depths; d++) { a += cnt[d * 8]; b += cnt[d * 8 + 1]; } tot[0] += a; tot[1] += b; } }
 
+// ---------------- full material integrator ----------------
+// OpenPBR-subset materials (render/bsdf.h), emissive triangles as area lights, environment map, sun; next-event
+// estimation with one light sample per vertex (light type chosen with probabilities pSun/pTri/pEnv, triangle by
+// power, environment texel by luminance * sin(theta)) combined with BSDF sampling by the power heuristic
+// (Veach 1997). Optional Russian roulette. Path state adds pAux = pdf of the last BSDF sample (<= 0: camera ray or
+// delta lobe, whose emission hits always count fully).
+__constant__ FullParams PF;
+
+__device__ __forceinline__ void envUV(float3 d, float& u, float& v) {
+    u = 0.5f - (atan2f(d.y, d.x) - PF.envRot) * (1.f / CWP_TWO_PI); u -= floorf(u);
+    v = acosf(fminf(fmaxf(d.z, -1.f), 1.f)) * CWP_INV_PI;
+}
+__device__ __forceinline__ float3 envDir(float u, float v) {
+    float ph = (0.5f - u) * CWP_TWO_PI + PF.envRot, th = v * CWP_PI; float st = sinf(th);
+    return mk3(st * cosf(ph), st * sinf(ph), cosf(th));
+}
+__device__ __forceinline__ void envTexel(float3 d, int& x, int& y, float& v) {
+    float u; envUV(d, u, v); x = min((int)(u * PF.envW), PF.envW - 1); y = min((int)(v * PF.envH), PF.envH - 1);
+}
+__device__ __forceinline__ float3 envRadiance(float3 d) { int x, y; float v; envTexel(d, x, y, v); return xyz(PF.envTex[y * PF.envW + x]); }
+__device__ __forceinline__ float envPdfTexel(int x, int y, float v) {
+    const float* cr = PF.envCond + (size_t)y * (PF.envW + 1);
+    float puv = (PF.envMarg[y + 1] - PF.envMarg[y]) * (cr[x + 1] - cr[x]) * PF.envW * PF.envH;
+    float st = sinf(v * CWP_PI); return st > 0.f ? puv / (2.f * CWP_PI * CWP_PI * st) : 0.f;
+}
+__device__ __forceinline__ float envPdf(float3 d) { int x, y; float v; envTexel(d, x, y, v); return envPdfTexel(x, y, v); }
+// largest i in [0, n) with cdf[i] <= u (cdf has n + 1 entries, cdf[0] = 0, cdf[n] = 1)
+__device__ __forceinline__ int cdfFind(const float* cdf, int n, float u) { int lo = 0, hi = n; while (hi - lo > 1) { int mid = (lo + hi) >> 1; if (cdf[mid] <= u) lo = mid; else hi = mid; } return lo; }
+
+template <int V, int TRI>
+__global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restrict__ nodes, const float4* __restrict__ trav_, const int* __restrict__ q, int n,
+        const float4* __restrict__ tris, const float4* __restrict__ nrm, float4* pO, float4* pD, float4* pT, int* pDepth, float* pAux, float4* accum,
+        int* qOut, int* qOutCnt, float4* sO, float4* sD, float4* sC, int* sCnt, int smpBase, int N) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x; if (k >= n) return;
+    int i = q[k];
+    float4 O = pO[i], D = pD[i]; float hitT = D.w; int tri = -1; float hu = 0, hv = 0;
+    trav<V, false, TRI>(nodes, trav_, xyz(O), xyz(D), O.w, hitT, tri, hu, hv);
+    float4 T4 = pT[i]; float3 T = xyz(T4); int pix = __float_as_int(T4.w);
+    float lastPdf = pAux[i]; int depth = pDepth[i]; int smp = smpBase + i / N;
+    float3 d = xyz(D);
+    if (tri < 0) {   // miss: environment (MIS-weighted) or constant sky (BSDF-sampled only)
+        float3 L;
+        if (PF.hasEnv) {
+            L = envRadiance(d);
+            if (lastPdf > 0.f) { if (PF.lightMode == kLightNEE) L = mk3(0.f, 0.f, 0.f); else if (PF.lightMode == kLightMIS) L = L * misPower(lastPdf, PF.pEnv * envPdf(d)); }
+        } else L = P.sky;
+        float3 c = T * L; if (c.x > 0.f || c.y > 0.f || c.z > 0.f) { atomicAdd(&accum[pix].x, c.x); atomicAdd(&accum[pix].y, c.y); atomicAdd(&accum[pix].z, c.z); }
+        return;
+    }
+    float3 p = xyz(O) + d * hitT;
+    float4 b4 = tris[3 * tri + 1], c4 = tris[3 * tri + 2];
+    float3 ng0 = normalize(cross(xyz(b4), xyz(c4)));
+    float3 ns = ng0;
+    if (P.hasN) { float3 n0 = xyz(nrm[3 * tri]), n1 = xyz(nrm[3 * tri + 1]), n2 = xyz(nrm[3 * tri + 2]); float3 nn = n0 * (1.f - hu - hv) + n1 * hu + n2 * hv; float l = length(nn); if (l > 0.f) ns = nn * (1.f / l); if (dot(ns, ng0) < 0.f) ns = -ns; }
+    bool front = dot(ng0, d) < 0.f;
+    float3 ng = front ? ng0 : -ng0; if (!front) ns = -ns;
+    const Material M = PF.mats[__float_as_int(b4.w)];
+    // emission (two-sided), MIS-weighted against light sampling of this triangle
+    if (M.emission.x > 0.f || M.emission.y > 0.f || M.emission.z > 0.f) {
+        float w = 1.f;
+        if (lastPdf > 0.f) {
+            if (PF.lightMode == kLightNEE) w = 0.f;
+            else if (PF.lightMode == kLightMIS) { float cl = fabsf(dot(ng0, d)); float pl = cl > 0.f ? PF.pTri * PF.triLightPdf[tri] * hitT * hitT / cl : 0.f; w = misPower(lastPdf, pl); }
+        }
+        float3 c = T * M.emission * w; if (w > 0.f) { atomicAdd(&accum[pix].x, c.x); atomicAdd(&accum[pix].y, c.y); atomicAdd(&accum[pix].z, c.z); }
+    }
+    if (depth > P.maxB) return;
+    if (PF.rr && depth >= PF.rrDepth) { float qs = fminf(fmaxf(maxc(T), 0.05f), 1.f); if (rnd(pix, smp, depth + 1, 6) >= qs) return; T = T * (1.f / qs); }
+    float3 wo = -d;
+    if (dot(ns, wo) <= 1e-6f) ns = ng;
+    float3 tx, ty; onb(ns, tx, ty);
+    float3 woL = mk3(dot(wo, tx), dot(wo, ty), dot(wo, ns));
+    float eta = front ? M.ior : 1.f / M.ior;
+    float3 poUp = p + ng * P.eps, poDn = p - ng * P.eps;
+    float ux1 = rnd(pix, smp, depth + 1, 7), ux2 = rng4(pix, smp, depth + 1, 7, P.seed ^ 0x68E31DA4u);   // glossy-diffuse albedo estimate
+    // ---- next-event estimation (one light sample) ----
+    if (bsdfHasNonDelta(M)) {
+        float us = rnd(pix, smp, depth + 1, 5), u2 = rnd(pix, smp, depth + 1, 2), u3 = rnd(pix, smp, depth + 1, 3);
+        float3 l = mk3(0.f, 0.f, 1.f), Le = mk3(0.f, 0.f, 0.f); float pl = 0.f, tmax = 1e30f; bool isSun = false, ok = false; int orgSide = 0;   // +1/-1: origin fixed by the triangle sample
+        if (us < PF.pSun) { l = sampleUniformCone(P.sunTo, P.sunCos, u2, u3); Le = P.sunE; pl = PF.pSun; isSun = true; ok = true; }
+        else if (us < PF.pSun + PF.pTri) {
+            float ut = fminf((us - PF.pSun) / PF.pTri, 0.99999994f);
+            int e = cdfFind(PF.emCdf, PF.nEm, ut); int kt = PF.emTri[e];
+            float4 a0 = tris[3 * kt], a1 = tris[3 * kt + 1], a2 = tris[3 * kt + 2];
+            float su = sqrtf(u2); float3 pL = xyz(a0) + xyz(a1) * (su * (1.f - u3)) + xyz(a2) * (su * u3);
+            float3 nL = normalize(cross(xyz(a1), xyz(a2)));
+            // connect from the shadow ray's actual (offset) origin so that tmax stops just short of the light point
+            orgSide = dot(ng, pL - p) > 0.f ? 1 : -1; float3 org = orgSide > 0 ? poUp : poDn;
+            float3 dv = pL - org; float dist2 = dot(dv, dv), dist = sqrtf(dist2);
+            if (dist > 0.f) {
+                l = dv * (1.f / dist); float cl = fabsf(dot(nL, l));
+                if (cl > 0.f) { pl = PF.pTri * PF.triLightPdf[kt] * dist2 / cl; Le = PF.mats[__float_as_int(a1.w)].emission; tmax = dist * (1.f - 1e-3f); ok = true; }
+            }
+        } else if (PF.pEnv > 0.f) {
+            float ue = fminf((us - PF.pSun - PF.pTri) / PF.pEnv, 0.99999994f);
+            int y = cdfFind(PF.envMarg, PF.envH, ue);
+            const float* cr = PF.envCond + (size_t)y * (PF.envW + 1);
+            int x = cdfFind(cr, PF.envW, u2);
+            float v = (y + u3) / PF.envH, u = (x + 0.5f) / PF.envW;
+            // continuous position inside the texel: reuse the leftover of u2 within the chosen column
+            float w0 = cr[x + 1] - cr[x]; if (w0 > 0.f) u = (x + fminf((u2 - cr[x]) / w0, 0.99999994f)) / PF.envW;
+            l = envDir(u, v); float pe = envPdfTexel(x, y, v);
+            if (pe > 0.f) { pl = PF.pEnv * pe; Le = xyz(PF.envTex[y * PF.envW + x]); ok = true; }
+        }
+        if (ok) {
+            float3 lL = mk3(dot(l, tx), dot(l, ty), dot(l, ns));
+            float gl = dot(ng, l);
+            if (lL.z != 0.f && (gl > 0.f) == (lL.z > 0.f)) {
+                BsdfEval e = bsdfEval(M, woL, lL, eta, PF.gdEnergy, ux1, ux2);
+                float w = (isSun || PF.lightMode == kLightNEE) ? 1.f : misPower(pl, e.pdf);
+                float3 contrib = T * e.f * Le * (fabsf(lL.z) * w / pl);
+                if (contrib.x > 0.f || contrib.y > 0.f || contrib.z > 0.f) {
+                    int s = atomicAdd(sCnt, 1);
+                    sO[s] = mk4((orgSide ? orgSide > 0 : gl > 0.f) ? poUp : poDn, 0.f); sD[s] = mk4(l, tmax); sC[s] = mk4(contrib, __int_as_float(pix));
+                }
+            }
+        }
+    }
+    // ---- BSDF sampling: continuation ray ----
+    float3 wiL, wgt; float pdf;
+    if (!bsdfSample(M, woL, eta, PF.gdEnergy, ux1, ux2, rnd(pix, smp, depth + 1, 4), rnd(pix, smp, depth + 1, 0), rnd(pix, smp, depth + 1, 1), wiL, wgt, pdf)) return;
+    float3 wi = normalize(tx * wiL.x + ty * wiL.y + ns * wiL.z);
+    float gi = dot(ng, wi);
+    if (gi == 0.f || (gi > 0.f) != (wiL.z > 0.f)) return;
+    T = T * wgt;
+    if (!(maxc(T) > 0.f)) return;
+    pO[i] = mk4(gi > 0.f ? poUp : poDn, 0.f); pD[i] = mk4(wi, 1e30f); pT[i] = mk4(T, __int_as_float(pix)); pDepth[i] = depth + 1; pAux[i] = pdf;
+    int s = atomicAdd(qOutCnt, 1); qOut[s] = i;
+}
+
 // ---------------- host driver ----------------
 static const int TB = 128;
 // dispatch helpers (V, TRI runtime -> template)
@@ -197,12 +330,33 @@ void WavefrontRenderer::init(const Params& H, const SceneBuffers& S, const Rende
         ptBlocks = bpm * prop.multiProcessorCount;
         fprintf(stderr, "trace kernel: %d blocks/SM x %d SMs (occupancy %.0f%%)\n", bpm, prop.multiProcessorCount, 100.0 * bpm * 128 / prop.maxThreadsPerMultiProcessor);
     }
+    if (O_.full) initFull(S);
     CK(cudaEventCreate(&f0)); CK(cudaEventCreate(&f1));
+}
+
+template <typename T> static T* upload(const std::vector<T>& v) { if (v.empty()) return nullptr; T* d; CK(cudaMalloc(&d, v.size() * sizeof(T))); CK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); return d; }
+
+void WavefrontRenderer::initFull(const SceneBuffers& S) {
+    size_t f0m, f1m, tm; CK(cudaMemGetInfo(&f0m, &tm));
+    FullParams F; memset(&F, 0, sizeof F);
+    F.mats = upload(S.mats); F.triLightPdf = upload(S.triLightPdf); F.emTri = upload(S.emTri); F.emCdf = upload(S.emCdf); F.nEm = (int)S.emTri.size();
+    F.hasEnv = S.env.w > 0 ? 1 : 0;
+    if (F.hasEnv) { F.envTex = upload(S.env.texels); F.envMarg = upload(S.env.marg); F.envCond = upload(S.env.cond); F.envW = S.env.w; F.envH = S.env.h; F.envRot = S.envRotDeg * 3.14159265f / 180.f; }
+    bool sun = S.sunOn, triL = F.nEm > 0 && O_.lightMode != kLightBSDF, envL = F.hasEnv && O_.lightMode != kLightBSDF;
+    int nt = (sun ? 1 : 0) + (triL ? 1 : 0) + (envL ? 1 : 0);
+    F.pSun = sun ? 1.f / nt : 0.f; F.pTri = triL ? 1.f / nt : 0.f; F.pEnv = envL ? 1.f / nt : 0.f;
+    F.lightMode = O_.lightMode; F.rr = O_.rr; F.rrDepth = O_.rrDepth; F.gdEnergy = O_.gdEnergy;
+    CK(cudaMemcpyToSymbol(PF, &F, sizeof F));
+    CK(cudaMalloc(&pAux, NK_ * 4));
+    CK(cudaMemGetInfo(&f1m, &tm)); vramMB += (double)(f0m - f1m) / 1048576.0;
+    fprintf(stderr, "full integrator: %zu materials, %d emissive triangles, env %dx%d, light selection sun %.2f tri %.2f env %.2f, mode %s, rr %d, glossy-diffuse energy compensation %d\n",
+            S.mats.size(), F.nEm, F.envW, F.envH, F.pSun, F.pTri, F.pEnv, O_.lightMode == kLightMIS ? "mis" : O_.lightMode == kLightNEE ? "nee" : "bsdf", O_.rr, O_.gdEnergy);
 }
 
 void WavefrontRenderer::launchTrace(int* q, int n) {
     if (n <= 0) return;
     const int N = N_;
+    if (O_.full) { int g = (n + TB - 1) / TB; DISPATCH(k_trace_shade_full, g, TB, (dNodes, dTrav, q, n, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut_, cnt, sO, sD, sC, cnt + 1, smp_, N)); return; }
     if (O_.fuse == 1) { int g = (n + TB - 1) / TB; DISPATCH3(k_trace_shade, false, g, TB, (dNodes, dTrav, q, n, dTris, dNrm, dAlb, pO, pD, pT, pDepth, accum, qOut_, cnt, sO, sD, sC, cnt + 1, smp_, N)); return; }
     if (O_.fuse == 2) { int g = (n + TB - 1) / TB; DISPATCH3(k_trace_shade, true, g, TB, (dNodes, dTrav, q, n, dTris, dNrm, dAlb, pO, pD, pT, pDepth, accum, qOut_, cnt, sO, sD, sC, cnt + 1, smp_, N)); return; }
     if (O_.persistent) { int g = ptBlocks < (n + 31) / 32 ? ptBlocks : (n + 31) / 32; CK(cudaMemsetAsync(cnt + 2, 0, 4)); DISPATCH(k_trace_dev, g, TB, (dNodes, dTrav, q, cnt + 8 * DEPTHS_, cnt + 2, pO, pD, hits)); }
@@ -224,6 +378,7 @@ void WavefrontRenderer::render(int spp, FrameStats& S) {
     CK(cudaEventRecord(f0));
     for (int s = 0; s < spp; s += K) {
         k_raygen<<<(int)((NK + 255) / 256), 256>>>(pO, pD, pT, pDepth, q0, s, K);
+        if (O_.full) CK(cudaMemsetAsync(pAux, 0, NK * 4));
         int* qIn = q0; int* qOut = q1; int* qS = q2; int n = (int)NK;
         if (!O_.devloop) {
             for (int depth = 0; depth < DEPTHS && n > 0; depth++) {
@@ -233,11 +388,11 @@ void WavefrontRenderer::render(int spp, FrameStats& S) {
                 qOut_ = qOut; smp_ = s;
                 cudaEvent_t a = nextEvent(), b = nextEvent(); CK(cudaEventRecord(a)); launchTrace(qIn, n); CK(cudaEventRecord(b)); pairs.push_back({ a, b });
                 S.rays += n;
-                if (!O_.fuse)
+                if (!O_.fuse && !O_.full)
                     k_shade<<<(n + 127) / 128, 128>>>(qIn, n, hits, dTris, dNrm, dAlb, pO, pD, pT, pDepth, accum, qOut, cnt, sO, sD, sC, cnt + 1, nullptr, s, N);
                 CK(cudaMemcpyAsync(hcnt, cnt, 8, cudaMemcpyDeviceToHost)); CK(cudaStreamSynchronize(0));
                 int nNext = hcnt[0], nSh = hcnt[1];
-                if (O_.fuse == 2) S.shadowRays += nSh;
+                if (O_.fuse == 2 && !O_.full) S.shadowRays += nSh;
                 else if (nSh > 0) {
                     if (O_.persistent) { hNK[1] = nSh; CK(cudaMemcpyAsync(cnt + 8 * DEPTHS + 1, hNK + 1, 4, cudaMemcpyHostToDevice)); }
                     cudaEvent_t c = nextEvent(), d = nextEvent(); CK(cudaEventRecord(c)); launchShadow(nSh); CK(cudaEventRecord(d)); pairs.push_back({ c, d }); S.shadowRays += nSh;

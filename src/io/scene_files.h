@@ -11,3 +11,8 @@ bool loadLightingFile(const std::string& path, Lighting& L, Mesh& m);
 // Reads the camera file. fx/fy are taken from it only when they are still 0 and the file's width/height match w/h;
 // otherwise hfov_deg is used (if hfov is still 0 and fx is present). c2w comes from key[frame].
 bool loadCameraFile(const std::string& path, const std::string& key, int frame, int w, int h, float& fx, float& fy, float& hfov, float c2w[16]);
+
+// Reads {"materials": [ {name, base_color, metallic, roughness, ior, specular_weight, specular_color, transmission,
+// emission_color, emission_strength}, ... ]}. Missing keys take OpenPBR defaults. An entry whose "name" matches a mesh
+// material name (OBJ usemtl) is assigned to that id; other entries are assigned by position (entry i -> id i).
+bool loadMaterialsFile(const std::string& path, Mesh& mesh);

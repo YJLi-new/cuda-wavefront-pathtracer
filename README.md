@@ -199,6 +199,13 @@ Each run prints one JSON line to stdout with ray counts, `t_frame_ms`, `t_trace_
 | `--seed`, `--warm`, `--reps` | 1000, 8, 1 | RNG seed, warm-up spp, number of timed frames |
 | `--persistent`, `--devloop`, `--sort` | 0 | Experimental variants from the ablation study. All are slower. |
 | `--out PREFIX` | out | Output path prefix |
+| `--materials PATH` | — | Material JSON (OpenPBR subset), described below |
+| `--env PATH` | — | Equirectangular Radiance `.hdr` environment map; replaces the constant sky |
+| `--env_strength S`, `--env_rot DEG` | 1, 0 | Environment radiance scale and rotation about world z |
+| `--integrator auto\|legacy\|full` | auto | `legacy` is the fast Lambert + sun + sky path the benchmarks use. `full` adds the material system, emissive triangles, the environment map and MIS. `auto` picks `full` only when the scene needs it. |
+| `--light_sampling mis\|nee\|bsdf` | mis | Full integrator: how emitters and the environment are sampled. `mis` combines light and BSDF sampling with the power heuristic. |
+| `--rr 0\|1`, `--rr_depth N` | 0, 3 | Full integrator: Russian roulette from depth N (off by default) |
+| `--gd_energy 0\|1` | 1 | Full integrator: energy compensation of the glossy-diffuse mix (albedo scaling); 0 = plain Fresnel-weighted mix |
 
 ### Input formats
 
@@ -219,13 +226,31 @@ Each run prints one JSON line to stdout with ray counts, `t_frame_ms`, `t_trace_
   "albedo_rgb_linear_by_material_index": [[0.5, 0.5, 0.5], [0.8, 0.35, 0.22]] }
 ```
 
-If `albedo_rgb_linear_by_material_index` is present it replaces the mesh's material colours, indexed by OBJ material order or PLY `material_index`.
+If `albedo_rgb_linear_by_material_index` is present it replaces the mesh's material colours, indexed by OBJ material order or PLY `material_index`. The lighting file may also set `"env_map"`, `"env_strength"` and `"env_rotation_deg"`.
+
+**Materials.** `--materials` takes a list of OpenPBR-style parameters; every key is optional. An entry whose `name` matches an OBJ `usemtl` name is assigned to that material; other entries are assigned by position (entry *i* is PLY `material_index` *i*).
+
+```json
+{ "materials": [
+  { "name": "gold", "base_color": [0.95, 0.64, 0.54], "metallic": 1.0, "roughness": 0.3, "specular_color": [1, 1, 1] },
+  { "name": "glass", "base_color": [1, 1, 1], "transmission": 1.0, "roughness": 0.1, "ior": 1.5 },
+  { "name": "paint", "base_color": [0.2, 0.4, 0.8], "roughness": 0.4, "ior": 1.5, "specular_weight": 1.0 },
+  { "name": "lamp", "base_color": [0.5, 0.5, 0.5], "emission_color": [1.0, 0.6, 0.3], "emission_strength": 3.0 } ] }
+```
+
+| Base | When | Model |
+|---|---|---|
+| Conductor | `metallic` = 1 | GGX microfacet reflection, Schlick Fresnel with the F82 tint term (Kutz et al. 2021), F0 = `base_color`, tint = `specular_color` |
+| Translucent dielectric | `transmission` = 1 | Rough GGX reflection and refraction (Walter et al. 2007), exact Fresnel, refraction tinted by `base_color`, no volume scattering |
+| Glossy-diffuse | otherwise | GGX dielectric specular (`ior`, `specular_weight`) over a Lambertian `base_color` lobe; a non-physical mix whose diffuse weight is 1 − (specular albedo) |
+
+Fractional `metallic` and `transmission` blend the three bases linearly. `roughness` *r* gives GGX α = *r*². Microfacet lobes are sampled from the distribution of visible normals with the spherical-cap method (Heitz 2018; Dupuy and Benyoub 2023), diffuse lobes with a cosine distribution. Emission is two-sided. Emissive triangles become area lights sampled by power. Each path vertex takes one light sample: sun, emissive triangle or environment texel (luminance × sin θ). This light sample is combined with the BSDF sample by the power heuristic (Veach 1997). Materials without specular, metal, transmission or emission are plain Lambert and use the legacy kernels unchanged.
 
 ## Limitations
 
-- **Materials.** Lambertian only, one albedo per material. There are no textures and no glossy, specular or transmissive BSDFs.
-- **Lights.** One sun and a constant sky. There is no environment-map importance sampling and there are no area, point or emissive lights.
-- **Sampling.** There is no Russian roulette, no adaptive sampling and no denoiser.
+- **Materials.** An OpenPBR subset only (conductor, rough dielectric, glossy-diffuse, emission). There are no textures yet, and no coat, sheen, subsurface, thin-film or volumes. Single-scattering GGX loses energy at high roughness. The benchmark numbers above use the legacy Lambert path.
+- **Lights.** Sun, constant sky or equirectangular `.hdr` environment map, and emissive triangles. There are no point or spot lights. The sun is only light-sampled, so it is not seen through glass or in mirrors.
+- **Sampling.** Russian roulette is optional and off by default. There is no adaptive sampling and no denoiser.
 - **Geometry.** Static triangle meshes only. The BVH is built single-threaded on the CPU at start-up, and this is excluded from frame times.
 - **Portability.** It compiles for any architecture nvcc supports, but it has been tuned and validated only on Hopper (sm_90).
 - **Scope of the speedup.** It was measured on one open outdoor scene with shallow paths and diffuse materials only. See the note under [Benchmarks](#benchmarks).
@@ -236,10 +261,11 @@ If `albedo_rgb_linear_by_material_index` is present it replaces the mesh's mater
 src/core/         float3 helpers, hash RNG, sampling warps (host + device, header-only)
 src/scene/        mesh, camera and lighting types; synthetic scene generator
 src/accel/        binned-SAH BVH2 builder; BVH2/BVH4/compressed BVH8 GPU layouts; triangle packing; device traversal
-src/render/       wavefront kernels (raygen, fused trace+shade, shade, shadow) and the host driver
+src/render/       wavefront kernels (raygen, fused trace+shade, shade, shadow, full-material trace+shade), BSDFs, host driver
 src/io/           OBJ/MTL and PLY loaders; camera and lighting JSON; PNG and PFM writers
 src/app/pt.cpp    the batch renderer CLI (build/pt)
 tools/psnr.py     PSNR in tonemapped sRGB (PNG, PFM or EXR inputs)
+tests/            CPU BSDF tests (chi-square, white furnace), material-sphere scene, Cycles reference script, MIS check
 scripts/          benchmark preset
 examples/         small OBJ scene with camera and lighting JSON
 CMakeLists.txt    build (one static library per module)

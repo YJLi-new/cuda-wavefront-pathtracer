@@ -10,12 +10,15 @@
 #include "io/scene_files.h"
 #include "render/renderer.h"
 #include "scene/camera.h"
+#include "scene/environment.h"
 #include "scene/synthetic.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
+#include "render/bsdf.h"
 
 struct Args {
     std::string mesh, camera, out = "out", variant = "bvh2", c2wKey = "c2w_blender_zup", tri = "mt";
@@ -25,6 +28,8 @@ struct Args {
     Lighting light;
     float epsScale = 1e-4f, near = 0.f;
     std::string c2w, lighting;
+    std::string materials, env, integrator = "auto", lightSampling = "mis";
+    float envStrength = -1.f, envRot = -1e30f; int rr = 0, rrDepth = 3, gdEnergy = 1;
 };
 
 static float3 parse3(char** a, int& i) { float3 v = mk3((float)atof(a[i + 1]), (float)atof(a[i + 2]), (float)atof(a[i + 3])); i += 3; return v; }
@@ -41,10 +46,14 @@ static bool parseArgs(int argc, char** argv, Args& A) {
         else if (k == "--devloop") A.devloop = ni(); else if (k == "--sort") A.sort = ni(); else if (k == "--fuse") A.fuse = ni(); else if (k == "--leaf") A.leaf = ni();
         else if (k == "--fx") A.fx = nf(); else if (k == "--fy") A.fy = nf(); else if (k == "--hfov") A.hfov = nf(); else if (k == "--seed") A.seed = (unsigned)ni();
         else if (k == "--sun_to") A.light.sunTo = parse3(argv, i); else if (k == "--sun_rgb") A.light.sunE = parse3(argv, i); else if (k == "--sky") A.light.sky = parse3(argv, i); else if (k == "--albedo") A.albedo = parse3(argv, i);
+        else if (k == "--materials") A.materials = argv[++i]; else if (k == "--env") A.env = argv[++i]; else if (k == "--env_strength") A.envStrength = nf(); else if (k == "--env_rot") A.envRot = nf();
+        else if (k == "--integrator") A.integrator = argv[++i]; else if (k == "--light_sampling") A.lightSampling = argv[++i]; else if (k == "--rr") A.rr = ni(); else if (k == "--rr_depth") A.rrDepth = ni(); else if (k == "--gd_energy") A.gdEnergy = ni();
         else if (k == "--sun_angle") A.light.sunAngleDeg = nf(); else if (k == "--eps") A.epsScale = nf(); else if (k == "--near") A.near = nf(); else if (k == "--lighting") A.lighting = argv[++i];
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return false; }
     }
     if (A.sort) A.devloop = 1;
+    if (A.integrator != "auto" && A.integrator != "legacy" && A.integrator != "full") { fprintf(stderr, "--integrator must be auto, legacy or full\n"); return false; }
+    if (A.lightSampling != "mis" && A.lightSampling != "nee" && A.lightSampling != "bsdf") { fprintf(stderr, "--light_sampling must be mis, nee or bsdf\n"); return false; }
     return true;
 }
 
@@ -66,6 +75,20 @@ int main(int argc, char** argv) {
     if (!A.lighting.empty() && !loadLightingFile(A.lighting, A.light, M)) return 1;
     if (A.albedo.x >= 0) for (auto& kd : M.kd) kd = A.albedo;
     if (M.kd.empty()) M.kd.push_back(mk3(0.8f, 0.8f, 0.8f));
+    if (!A.materials.empty() && !loadMaterialsFile(A.materials, M)) return 1;
+    if (!A.env.empty()) A.light.envMap = A.env;
+    if (A.envStrength >= 0.f) A.light.envStrength = A.envStrength;
+    if (A.envRot > -1e29f) A.light.envRotDeg = A.envRot;
+    // material table: materials-file entries, else Lambertian kd; --albedo overrides every base colour
+    std::vector<Material> mats;
+    { int maxMat = 0; for (int t : M.fm) if (t > maxMat) maxMat = t;
+      size_t nm = std::max(std::max(M.kd.size(), M.mat.size()), (size_t)maxMat + 1);
+      for (size_t j = 0; j < nm; j++) { Material m = j < M.mat.size() ? M.mat[j] : lambertMaterial(j < M.kd.size() ? M.kd[j] : mk3(0.8f, 0.8f, 0.8f)); if (A.albedo.x >= 0) m.baseColor = A.albedo; mats.push_back(m); } }
+    bool needFull = A.rr != 0 || !A.light.envMap.empty();
+    for (auto& m : mats) if (!isLambert(m) || isEmissive(m)) needFull = true;
+    const bool full = A.integrator == "full" || (A.integrator == "auto" && needFull);
+    if (A.integrator == "legacy" && needFull) fprintf(stderr, "warn: --integrator legacy ignores specular/transmissive/emissive materials, the environment map and RR\n");
+    if (full && (A.persistent || A.devloop || A.sort || A.fuse != 1)) { fprintf(stderr, "note: the full integrator always uses the fused kernel; --persistent/--devloop/--sort/--fuse ignored\n"); A.persistent = A.devloop = A.sort = 0; A.fuse = 1; }
     double loadS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     AABB sb; for (auto& v : M.v) sb.grow(v);
     float extent = maxc(sb.extent());
@@ -98,7 +121,28 @@ int main(int argc, char** argv) {
     else { BVH8Flat F; F.build(B); S.nodes.swap(F.nodes); S.nodeStride = 5; order.swap(F.order); }
     packTriangles(M, order, S.tris, S.nrm);
     if (TRI == 1) packWoop(M, order, S.woop);
-    S.albedo = M.kd;
+    for (auto& m : mats) S.albedo.push_back(m.baseColor);
+    if (full) {
+        S.mats = mats; S.sunOn = luminance(A.light.sunE) > 0.f;
+        // emissive triangles (BVH leaf order) sampled proportionally to power = luminance(emission) * area
+        std::vector<double> pw; double tot = 0;
+        for (size_t kk = 0; kk < order.size(); kk++) {
+            int t = order[kk]; int mi = M.fm.empty() ? 0 : M.fm[t]; const Material& m = mats[mi];
+            if (!isEmissive(m)) continue;
+            float3 e1 = M.v[M.f[t].y] - M.v[M.f[t].x], e2 = M.v[M.f[t].z] - M.v[M.f[t].x]; double area = 0.5 * length(cross(e1, e2));
+            double pwr = luminance(m.emission) * area; if (!(pwr > 0)) continue;
+            S.emTri.push_back((int)kk); pw.push_back(pwr); tot += pwr;
+        }
+        if (!S.emTri.empty()) {
+            S.triLightPdf.assign(order.size(), 0.f); S.emCdf.assign(S.emTri.size() + 1, 0.f); double c = 0;
+            for (size_t e = 0; e < S.emTri.size(); e++) {
+                int kk = S.emTri[e], t = order[kk]; float3 e1 = M.v[M.f[t].y] - M.v[M.f[t].x], e2 = M.v[M.f[t].z] - M.v[M.f[t].x]; double area = 0.5 * length(cross(e1, e2));
+                S.triLightPdf[kk] = (float)(pw[e] / tot / area); c += pw[e]; S.emCdf[e + 1] = (float)(c / tot);
+            }
+            S.emCdf.back() = 1.f;
+        }
+        if (!A.light.envMap.empty()) { if (!buildEnvMap(A.light.envMap, A.light.envStrength, S.env)) return 1; S.envRotDeg = A.light.envRotDeg; }
+    }
     double bvhS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     size_t nNodes = S.nodes.size() / S.nodeStride, nodeBytes = S.nodes.size() * 16;
     fprintf(stderr, "BVH%d: %zu nodes (%.1f MB), depth %d, build %.2fs, tri=%s\n", V, nNodes, nodeBytes / 1e6, B.maxDepth, bvhS, A.tri.c_str());
@@ -106,7 +150,8 @@ int main(int argc, char** argv) {
     // ---- GPU ----
     int K = A.batch < 1 ? 1 : A.batch;
     if (A.spp % K) { fprintf(stderr, "spp must be a multiple of batch\n"); return 1; }
-    RenderOptions O; O.variant = V; O.tri = TRI; O.fuse = A.fuse; O.persistent = A.persistent; O.devloop = A.devloop; O.sort = A.sort; O.batch = K; O.bounces = A.bounces;
+    RenderOptions O; O.full = full ? 1 : 0; O.lightMode = A.lightSampling == "nee" ? kLightNEE : A.lightSampling == "bsdf" ? kLightBSDF : kLightMIS; O.rr = A.rr; O.rrDepth = A.rrDepth; O.gdEnergy = A.gdEnergy;
+    O.variant = V; O.tri = TRI; O.fuse = A.fuse; O.persistent = A.persistent; O.devloop = A.devloop; O.sort = A.sort; O.batch = K; O.bounces = A.bounces;
     WavefrontRenderer R; R.init(H, S, O);
     const int N = A.w * A.h;
 
@@ -116,10 +161,10 @@ int main(int argc, char** argv) {
         FrameStats st; R.render(A.spp, st);
         double tot = st.rays + st.shadowRays;
         printf("{\"rep\":%d,\"variant\":\"bvh%d\",\"tri\":\"%s\",\"persistent\":%d,\"devloop\":%d,\"sort\":%d,\"fuse\":%d,\"leaf\":%d,\"batch\":%d,\"minb\":%d,\"scene\":\"%s\",\"tris\":%zu,\"bvh_nodes\":%zu,\"bvh_bytes\":%zu,\"bvh_depth\":%d,\"bvh_build_s\":%.2f,\"w\":%d,\"h\":%d,\"spp\":%d,\"bounces\":%d,"
-               "\"rays_closest\":%.0f,\"rays_shadow\":%.0f,\"rays_total\":%.0f,\"t_trace_ms\":%.2f,\"t_frame_ms\":%.2f,\"mrays_s_trace\":%.1f,\"mrays_s_e2e\":%.1f,\"avg_path_len\":%.3f,\"vram_MB\":%.0f,\"pt_blocks\":%d,\"gpu\":\"%s\",\"filter\":\"%s\",\"smooth\":%d,\"seed\":%u}\n",
+               "\"rays_closest\":%.0f,\"rays_shadow\":%.0f,\"rays_total\":%.0f,\"t_trace_ms\":%.2f,\"t_frame_ms\":%.2f,\"mrays_s_trace\":%.1f,\"mrays_s_e2e\":%.1f,\"avg_path_len\":%.3f,\"vram_MB\":%.0f,\"pt_blocks\":%d,\"gpu\":\"%s\",\"filter\":\"%s\",\"smooth\":%d,\"seed\":%u,\"integrator\":\"%s\"}\n",
                r, V, A.tri.c_str(), A.persistent, A.devloop, A.sort, A.fuse, B.leafMax, K, rendererMinBlocks(),
                A.synthetic ? "synthetic" : A.mesh.c_str(), M.f.size(), nNodes, nodeBytes, B.maxDepth, bvhS, A.w, A.h, A.spp, A.bounces,
-               st.rays, st.shadowRays, tot, st.traceMs, st.frameMs, tot / (st.traceMs * 1e3), tot / (st.frameMs * 1e3), st.rays / ((double)N * A.spp), R.vramMB, R.ptBlocks, R.gpuName.c_str(), A.filterBH ? "blackman-harris1.5" : "box", H.hasN, A.seed);
+               st.rays, st.shadowRays, tot, st.traceMs, st.frameMs, tot / (st.traceMs * 1e3), tot / (st.frameMs * 1e3), st.rays / ((double)N * A.spp), R.vramMB, R.ptBlocks, R.gpuName.c_str(), A.filterBH ? "blackman-harris1.5" : "box", H.hasN, A.seed, full ? (A.lightSampling == "mis" ? "full-mis" : A.lightSampling == "nee" ? "full-nee" : "full-bsdf") : "legacy");
         fflush(stdout);
     }
     std::vector<float4> acc; R.readAccum(acc);
