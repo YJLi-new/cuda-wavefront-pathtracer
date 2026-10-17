@@ -20,7 +20,7 @@ if command -v cmake > /dev/null; then
   cmake --build build -j "$J" --target pt > build/pt.log 2>&1 || { cat build/pt.log; exit 1; }
   cmake --build build -j "$J" > build/all.log 2>&1 || { cat build/all.log; exit 1; }
 else
-  SRC="src/app/pt.cpp src/render/wavefront.cu $(ls src/scene/*.cpp src/io/*.cpp src/accel/*.cpp | tr '\n' ' ')"
+  SRC="src/app/pt.cpp src/render/wavefront.cu src/accel/hploc.cu $(ls src/scene/*.cpp src/io/*.cpp src/accel/*.cpp | tr '\n' ' ')"
   FLAGS="-O3 -std=c++17 -arch=${ARCH} --use_fast_math -lineinfo --ptxas-options=-v -Isrc"
   "${NVCC}" ${FLAGS} -DMINB=12 -o build/pt ${SRC} > build/pt.log 2>&1 || { cat build/pt.log; exit 1; }
   if [ "${VARIANTS:-0}" = "1" ]; then

@@ -15,6 +15,7 @@ struct Params {
     float ftab[kFilterTable + 1];
 };
 
+#include "accel/instance.h"
 #include "scene/material.h"
 #include "scene/texture.h"
 
@@ -23,6 +24,10 @@ enum LightMode { kLightMIS = 0, kLightNEE = 1, kLightBSDF = 2 };
 
 // parameters of the full material integrator (render/wavefront.cu, k_trace_shade_full); device pointers
 struct FullParams {
+    // instanced scenes: TLAS (BVH2 nodes over instances, rebuilt on the GPU per frame), instances, emissive triangles
+    // in world space (3 float4 each: (v0, BVH leaf position of the triangle), (e1, material), (e2, 0)) and the area pdf
+    // of light sampling per material (luminance(emission) / total emitted power)
+    const float4* tlas; int tlasRoot; const DevInstance* inst; const float4* emTris; const float* matLightPdf;
     const Material* mats;
     const float* triLightPdf;      // per triangle (BVH leaf order): selection probability / area, 0 if not emissive
     const int* emTri; const float* emCdf; int nEm;   // emissive triangles (leaf order) and their power CDF (nEm + 1)

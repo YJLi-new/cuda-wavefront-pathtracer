@@ -4,7 +4,7 @@
 // Written from scratch following Aila & Laine 2009 (BVH2 layout, nearer-child-first stack traversal) and
 // Ylitie et al. 2017 (compressed wide BVH traversal with octant-ordered child slots).
 #pragma once
-#include "core/vec.h"
+#include "accel/instance.h"
 
 // ---------------- triangle tests ----------------
 template <bool ANY, int TRI>
@@ -43,8 +43,8 @@ __device__ __forceinline__ bool isectLeaf(const float4* __restrict__ tris, int f
 
 // ---------------- BVH2 traversal ----------------
 template <bool ANY, int TRI>
-__device__ __forceinline__ bool trav2(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& hitT, int& hitTri, float& hu, float& hv) {
-    int stack[64]; int sp = 0; int node = 0;
+__device__ __forceinline__ bool trav2(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& hitT, int& hitTri, float& hu, float& hv, int root = 0) {
+    int stack[64]; int sp = 0; int node = root;
     const float ooeps = 1e-20f;
     float idx = 1.f / (fabsf(d.x) > ooeps ? d.x : copysignf(ooeps, d.x));
     float idy = 1.f / (fabsf(d.y) > ooeps ? d.y : copysignf(ooeps, d.y));
@@ -72,8 +72,8 @@ __device__ __forceinline__ bool trav2(const float4* __restrict__ nodes, const fl
 // ---------------- BVH4 traversal ----------------
 #define CSWAP(a, b) { if (ht##b < ht##a) { float tf = ht##a; ht##a = ht##b; ht##b = tf; int ti = hc##a; hc##a = hc##b; hc##b = ti; } }
 template <bool ANY, int TRI>
-__device__ __forceinline__ bool trav4(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& hitT, int& hitTri, float& hu, float& hv) {
-    int stack[64]; int sp = 0; int node = 0;
+__device__ __forceinline__ bool trav4(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& hitT, int& hitTri, float& hu, float& hv, int root = 0) {
+    int stack[64]; int sp = 0; int node = root;
     const float ooeps = 1e-20f;
     float idx = 1.f / (fabsf(d.x) > ooeps ? d.x : copysignf(ooeps, d.x));
     float idy = 1.f / (fabsf(d.y) > ooeps ? d.y : copysignf(ooeps, d.y));
@@ -110,14 +110,14 @@ __device__ __forceinline__ bool trav4(const float4* __restrict__ nodes, const fl
 // ---------------- BVH8 compressed traversal (CWBVH-style) ----------------
 #define B8(u, s) (((u) >> (8 * ((s) & 3))) & 255u)
 template <bool ANY, int TRI>
-__device__ __forceinline__ bool trav8(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& hitT, int& hitTri, float& hu, float& hv) {
+__device__ __forceinline__ bool trav8(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& hitT, int& hitTri, float& hu, float& hv, int root = 0) {
     uint2 stack[40]; int sp = 0;
     const float ooeps = 1e-20f;
     float idx = 1.f / (fabsf(d.x) > ooeps ? d.x : copysignf(ooeps, d.x));
     float idy = 1.f / (fabsf(d.y) > ooeps ? d.y : copysignf(ooeps, d.y));
     float idz = 1.f / (fabsf(d.z) > ooeps ? d.z : copysignf(ooeps, d.z));
     unsigned p = (d.x > 0.f ? 1u : 0u) | (d.y > 0.f ? 2u : 0u) | (d.z > 0.f ? 4u : 0u);
-    unsigned cb = 0, im = 0, hm = 0; int node = 0;
+    unsigned cb = 0, im = 0, hm = 0; int node = root;
     while (true) {
         const float4* nb = nodes + node * 5;
         float4 f0 = nb[0], f1 = nb[1], f2 = nb[2], f3 = nb[3], f4 = nb[4];
@@ -153,8 +153,8 @@ __device__ __forceinline__ bool trav8(const float4* __restrict__ nodes, const fl
 #undef B8
 
 template <int V, bool ANY, int TRI>
-__device__ __forceinline__ bool trav(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& hitT, int& hitTri, float& hu, float& hv) {
-    if (V == 2) return trav2<ANY, TRI>(nodes, tris, o, d, tmin, hitT, hitTri, hu, hv);
-    if (V == 4) return trav4<ANY, TRI>(nodes, tris, o, d, tmin, hitT, hitTri, hu, hv);
-    return trav8<ANY, TRI>(nodes, tris, o, d, tmin, hitT, hitTri, hu, hv);
+__device__ __forceinline__ bool trav(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& hitT, int& hitTri, float& hu, float& hv, int root = 0) {
+    if (V == 2) return trav2<ANY, TRI>(nodes, tris, o, d, tmin, hitT, hitTri, hu, hv, root);
+    if (V == 4) return trav4<ANY, TRI>(nodes, tris, o, d, tmin, hitT, hitTri, hu, hv, root);
+    return trav8<ANY, TRI>(nodes, tris, o, d, tmin, hitT, hitTri, hu, hv, root);
 }

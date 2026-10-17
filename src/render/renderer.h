@@ -1,6 +1,7 @@
 // render/renderer.h - wavefront path tracer on the GPU (Laine et al. 2013): raygen -> per-bounce
 // [trace (closest hit) -> shade (sun NEE + cosine continuation) -> shadow (any hit)] with atomic-append queues.
 #pragma once
+#include "accel/hploc.h"
 #include "render/params.h"
 #include "scene/environment.h"
 #include <string>
@@ -10,23 +11,25 @@
 struct RenderOptions {
     int variant = 2;      // BVH layout: 2, 4 or 8 (compressed)
     int tri = 0;          // triangle test: 0 Moller-Trumbore, 1 Woop
-    int fuse = 0;         // 1 fused trace+shade kernel, 2 also traces the shadow ray inline
-    int persistent = 0;   // experimental persistent-thread trace/shadow kernels
+    int fuse = 0;         // 1 fused trace+shade kernel, 2 also traces the shadow ray inline (legacy); full integrator: 1 fused, 0 split
+    int persistent = 0;   // persistent-thread traversal (legacy: warp-chunk fetch; full integrator: dynamic ray fetching, split kernels)
     int devloop = 0;      // experimental device-driven bounce loop (no host sync)
     int sort = 0;         // experimental bounce-ray sort (implies devloop)
     int batch = 64;       // samples per pixel in flight per wavefront pass
     int bounces = 8;      // max bounce depth (camera hit = depth 0)
-    int full = 0;         // 1: full material integrator (always fused; persistent/devloop/sort are legacy-only)
+    int full = 0;         // 1: full material integrator
     int lightMode = kLightMIS; int rr = 0, rrDepth = 3;
     int gdEnergy = 1;     // glossy-diffuse energy compensation (albedo scaling); 0 = plain Fresnel-weighted mix
     int envUniform = 0;   // environment light sampling: 0 importance (luminance x sin theta), 1 uniform sphere
     int texNearest = 0;   // texture filtering: 0 bilinear, 1 nearest texel
     int bumpShadow = 0;   // bump-terminator shadowing term (Chiang et al. 2019) on normal-mapped diffuse lobes
+    int graph = 0;        // full integrator: launch each frame's kernel sequence as one CUDA graph (device-side queue counts)
+    int inst = 0;         // full integrator: two-level scene (TLAS over instances, BLAS per mesh)
 };
 
 // host copies of the scene, uploaded once by init()
 struct SceneBuffers {
-    std::vector<float4> nodes; int nodeStride = 4;   // float4s per node
+    std::vector<float4> nodes; int nodeStride = 4;   // float4s per node (instanced: all BLASes, absolute indices)
     std::vector<float4> tris, nrm, woop;             // see accel/tri_pack.h; nrm/woop may be empty
     std::vector<float3> albedo;
     // full integrator only
@@ -35,6 +38,8 @@ struct SceneBuffers {
     EnvMapHost env; float envRotDeg = 0.f; bool sunOn = true;
     // textures (full integrator; empty when no material is textured), see render/params.h
     std::vector<MaterialTextures> mtex; std::vector<TextureImage> tex; std::vector<float4> uvs, tans;
+    // instanced scenes: number of instances, object-space box per mesh (lo, hi), number of emissive instance triangles
+    int nInst = 0; std::vector<float4> meshBox; int nEmInst = 0;
 };
 
 struct FrameStats { double rays = 0, shadowRays = 0, traceMs = 0, frameMs = 0; };
@@ -43,24 +48,36 @@ class WavefrontRenderer {
 public:
     // Selects device 0, uploads the scene and allocates path state for w*h*batch paths. Exits on CUDA errors.
     void init(const Params& P, const SceneBuffers& S, const RenderOptions& O);
+    // instanced scenes, before each frame: instance records, world-space emissive triangles + their power CDF and the
+    // per-material light pdf; rebuilds the TLAS on the GPU (H-PLOC) and records its time in tlasMs
+    void setInstances(const std::vector<DevInstance>& inst, const std::vector<float4>& emTris, const std::vector<float>& emCdf, const std::vector<float>& matLightPdf);
     // renders spp samples per pixel (multiple of batch) into a cleared accumulation buffer
     void render(int spp, FrameStats& st);
     void readAccum(std::vector<float4>& acc) const;   // per-pixel radiance sums (divide by spp)
 
-    double vramMB = 0; int ptBlocks = 0; std::string gpuName;
+    double vramMB = 0, tlasMs = 0; int ptBlocks = 0; std::string gpuName;
 
 private:
     void launchTrace(int* q, int n);
     void launchShadow(int n);
     cudaEvent_t nextEvent();
     void initFull(const SceneBuffers& S);
+    void renderFull(int spp, FrameStats& st);
+    void enqueueFullPasses(int spp);
+    void launchFullTrace(int* q, const int* nPtr, int n, int* qOut, int* qOutCnt, int* sCnt, int* fetch, int smp);
+    void launchFullShadow(const int* nPtr, int n, int* fetch);
 
-    RenderOptions O_; int V_ = 2, TRI_ = 0, N_ = 0, K_ = 1, DEPTHS_ = 0; size_t NK_ = 0;
+    RenderOptions O_; int V_ = 2, TRI_ = 0, INST_ = 0, N_ = 0, K_ = 1, DEPTHS_ = 0, nSM_ = 0; size_t NK_ = 0;
     float4 *dNodes = nullptr, *dTris = nullptr, *dNrm = nullptr, *dWoop = nullptr; const float4* dTrav = nullptr; float3* dAlb = nullptr;
     float4 *pO, *pD, *pT, *hits, *sO, *sD, *sC, *accum; int *pDepth, *q0, *q1, *q2, *cnt, *hist; unsigned* keys = nullptr; unsigned long long* dtot;
-    int *hcnt, *hNK; float* pAux = nullptr;
+    int *hcnt, *hNK; float* pAux = nullptr; int* hitI = nullptr;
     int* qOut_ = nullptr; int smp_ = 0;
     std::vector<cudaEvent_t> evs; size_t evUsed = 0; cudaEvent_t f0, f1;
+    // full integrator: stream, CUDA graph, persistent grid sizes, instanced-scene buffers
+    cudaStream_t st_ = nullptr; cudaGraphExec_t gexec_ = nullptr; int gSpp_ = -1;
+    int ptTraceBlocks_ = 0, ptShadowBlocks_ = 0, gridCap_ = 0;
+    int nInst_ = 0, nEmInst_ = 0; DevInstance* dInst = nullptr; float4 *dTlas = nullptr, *dBoxLo = nullptr, *dBoxHi = nullptr, *dMeshBox = nullptr, *dEmTris = nullptr;
+    float *dEmCdf = nullptr, *dMatLightPdf = nullptr; HplocBuilder hploc_; cudaEvent_t tl0, tl1;
 };
 
 // __launch_bounds__ min-blocks value the renderer was compiled with (0 = no register cap)

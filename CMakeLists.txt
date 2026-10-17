@@ -25,11 +25,11 @@ add_library(cwp_core INTERFACE)
 target_include_directories(cwp_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CUDAToolkit_INCLUDE_DIRS})
 
 # scene: mesh, camera, lighting, procedural scenes
-add_library(cwp_scene STATIC src/scene/camera.cpp src/scene/synthetic.cpp src/scene/environment.cpp src/scene/tangents.cpp src/io/hdr_image.cpp)
+add_library(cwp_scene STATIC src/scene/camera.cpp src/scene/synthetic.cpp src/scene/environment.cpp src/scene/tangents.cpp src/scene/instances.cpp src/io/hdr_image.cpp src/io/json.cpp)
 target_link_libraries(cwp_scene PUBLIC cwp_core)
 
 # io: mesh loaders, camera/lighting files, image writers
-add_library(cwp_io STATIC src/io/mesh_loader.cpp src/io/assimp_loader.cpp src/io/json.cpp src/io/scene_files.cpp src/io/image.cpp)
+add_library(cwp_io STATIC src/io/mesh_loader.cpp src/io/assimp_loader.cpp src/io/scene_files.cpp src/io/image.cpp)
 target_link_libraries(cwp_io PUBLIC cwp_scene)
 
 # optional Assimp model loading (obj/ply/fbx/gltf/glb) + stb_image textures, fetched at configure time and pinned:
@@ -62,15 +62,16 @@ if(CWP_WITH_ASSIMP)
   target_link_libraries(cwp_io PRIVATE assimp)
 endif()
 
-# accel: CPU BVH builder and GPU layouts (device traversal lives in accel/traverse.cuh)
-add_library(cwp_accel STATIC src/accel/bvh_builder.cpp src/accel/bvh_layouts.cpp src/accel/tri_pack.cpp)
+# accel: CPU BVH builder, GPU layouts, CWBVH collapse, GPU H-PLOC builder (device traversal lives in accel/traverse*.cuh)
+add_library(cwp_accel STATIC src/accel/bvh_builder.cpp src/accel/bvh_layouts.cpp src/accel/bvh_tools.cpp src/accel/tri_pack.cpp src/accel/hploc.cu)
+target_compile_options(cwp_accel PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -lineinfo>)
 target_link_libraries(cwp_accel PUBLIC cwp_scene)
 
 # render: wavefront kernels + host driver; one library per register cap
 set(CWP_CUDA_FLAGS --use_fast_math -lineinfo --ptxas-options=-v)
 function(cwp_add_render name minb)
   add_library(${name} STATIC src/render/wavefront.cu)
-  target_link_libraries(${name} PUBLIC cwp_core CUDA::cudart_static)
+  target_link_libraries(${name} PUBLIC cwp_core cwp_accel CUDA::cudart_static)
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CWP_CUDA_FLAGS}>)
   if(minb GREATER 0)
     target_compile_definitions(${name} PRIVATE MINB=${minb})

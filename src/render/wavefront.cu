@@ -4,7 +4,8 @@
 // fused trace+shade; host-driven loop (one sync per bounce) or experimental device-driven loop (persistent-style
 // kernels reading queue counts from device memory) with optional counting-sort binning of bounce rays by
 // (direction octant, Morton code of origin). Legacy shading: Lambert + sun next-event estimation + constant sky.
-// Full integrator (k_trace_shade_full): OpenPBR-subset materials, area lights, environment map, MIS, RR.
+// Full integrator (k_trace_shade_full / split + persistent kernels): OpenPBR-subset materials, area lights, environment map, MIS, RR;
+// single-level or instanced (TLAS/BLAS) scenes; optional CUDA-graph launch of the per-frame kernel sequence.
 #include "render/renderer.h"
 #include "accel/traverse.cuh"
 #include "core/rng.h"
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 #ifndef MINB
@@ -203,14 +205,25 @@ __device__ __forceinline__ float texComp(float4 c, int ch) { return ch == 0 ? c.
 // largest i in [0, n) with cdf[i] <= u (cdf has n + 1 entries, cdf[0] = 0, cdf[n] = 1)
 __device__ __forceinline__ int cdfFind(const float* cdf, int n, float u) { int lo = 0, hi = n; while (hi - lo > 1) { int mid = (lo + hi) >> 1; if (cdf[mid] <= u) lo = mid; else hi = mid; } return lo; }
 
-template <int V, int TRI>
-__global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restrict__ nodes, const float4* __restrict__ trav_, const int* __restrict__ q, int n,
+// ---------------- full integrator: traversal of single-level or instanced (TLAS/BLAS) scenes ----------------
+#include "accel/traverse_inst.cuh"
+#include "accel/hploc.h"
+#define FULLMASK 0xffffffffu
+static constexpr int kPtFetch = 8;   // persistent traversal: a warp fetches new rays once >= kPtFetch of its lanes are idle
+
+template <int V, bool ANY, int TRI, bool INST>
+__device__ __forceinline__ bool sceneTrav(const float4* __restrict__ nodes, const float4* __restrict__ tris, float3 o, float3 d, float tmin, float& t, int& tri, float& u, float& v, int& inst) {
+    if (INST) return travInst<V, ANY, TRI>(PF.tlas, PF.tlasRoot, PF.inst, nodes, tris, o, d, tmin, t, tri, u, v, inst);
+    return trav<V, ANY, TRI>(nodes, tris, o, d, tmin, t, tri, u, v);
+}
+
+// Shading of one closest hit (or miss) of path i: emission / environment with MIS, one NEE sample (queued as a shadow
+// ray), BSDF-sampled continuation (appended to qOut). INST: hit in instance hinst; geometry is in object space and is
+// transformed here (normals by inv^T, tangents by the forward matrix, handedness and orientation by sign(det)).
+template <bool INST>
+__device__ __forceinline__ void shadeFull(int i, float4 O, float4 D, float hitT, int tri, float hu, float hv, int hinst,
         const float4* __restrict__ tris, const float4* __restrict__ nrm, float4* pO, float4* pD, float4* pT, int* pDepth, float* pAux, float4* accum,
         int* qOut, int* qOutCnt, float4* sO, float4* sD, float4* sC, int* sCnt, int smpBase, int N) {
-    int k = blockIdx.x * blockDim.x + threadIdx.x; if (k >= n) return;
-    int i = q[k];
-    float4 O = pO[i], D = pD[i]; float hitT = D.w; int tri = -1; float hu = 0, hv = 0;
-    trav<V, false, TRI>(nodes, trav_, xyz(O), xyz(D), O.w, hitT, tri, hu, hv);
     float4 T4 = pT[i]; float3 T = xyz(T4); int pix = __float_as_int(T4.w);
     float lastPdf = pAux[i]; int depth = pDepth[i]; int smp = smpBase + i / N;
     float3 d = xyz(D);
@@ -225,9 +238,15 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
     }
     float3 p = xyz(O) + d * hitT;
     float4 b4 = tris[3 * tri + 1], c4 = tris[3 * tri + 2];
-    float3 ng0 = normalize(cross(xyz(b4), xyz(c4)));
+    float4 xr[3], xf[3]; float dsg = 1.f;   // INST: inverse and forward rows of the hit instance
+    if (INST) { const DevInstance* XI = PF.inst + hinst; xr[0] = XI->inv[0]; xr[1] = XI->inv[1]; xr[2] = XI->inv[2]; xf[0] = XI->fwd[0]; xf[1] = XI->fwd[1]; xf[2] = XI->fwd[2]; dsg = XI->detSign; }
+    float3 ng0 = INST ? normalize(xfRowsN(xr, cross(xyz(b4), xyz(c4)))) * dsg : normalize(cross(xyz(b4), xyz(c4)));
     float3 ns = ng0;
-    if (P.hasN) { float3 n0 = xyz(nrm[3 * tri]), n1 = xyz(nrm[3 * tri + 1]), n2 = xyz(nrm[3 * tri + 2]); float3 nn = n0 * (1.f - hu - hv) + n1 * hu + n2 * hv; float l = length(nn); if (l > 0.f) ns = nn * (1.f / l); if (dot(ns, ng0) < 0.f) ns = -ns; }
+    if (P.hasN) {
+        float3 n0 = xyz(nrm[3 * tri]), n1 = xyz(nrm[3 * tri + 1]), n2 = xyz(nrm[3 * tri + 2]); float3 nn = n0 * (1.f - hu - hv) + n1 * hu + n2 * hv;
+        if (INST) nn = xfRowsN(xr, nn);
+        float l = length(nn); if (l > 0.f) ns = nn * (1.f / l); if (dot(ns, ng0) < 0.f) ns = -ns;
+    }
     const int mid = __float_as_int(b4.w); float3 nsU = ns; bool mapped = false;   // nsU: unperturbed normal (bump-terminator term)
     Material M = PF.mats[mid];
     if (PF.mtex && mid < PF.nMtex) {   // textures multiply the material factors (glTF metallic-roughness semantics)
@@ -241,6 +260,7 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
             if (X.normal >= 0 && PF.tans) {   // tangent-space normal map: n = T x + B y + N z, B = w cross(N, T)
                 float w0 = 1.f - hu - hv; float4 t0 = PF.tans[3 * tri], t1 = PF.tans[3 * tri + 1], t2 = PF.tans[3 * tri + 2];
                 float3 t = xyz(t0) * w0 + xyz(t1) * hu + xyz(t2) * hv; float sg = (t0.w * w0 + t1.w * hu + t2.w * hv) < 0.f ? -1.f : 1.f;
+                if (INST) { t = xfRowsV(xf, t); sg *= dsg; }
                 t = t - ns * dot(ns, t); float tl = length(t);
                 if (tl > 0.f) {
                     t = t * (1.f / tl); float3 bt = cross(ns, t) * sg; float4 c = texRGBA(X.normal, uv);
@@ -257,7 +277,7 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
         float w = 1.f;
         if (lastPdf > 0.f) {
             if (PF.lightMode == kLightNEE) w = 0.f;
-            else if (PF.lightMode == kLightMIS) { float cl = fabsf(dot(ng0, d)); float pl = cl > 0.f ? PF.pTri * PF.triLightPdf[tri] * hitT * hitT / cl : 0.f; w = misPower(lastPdf, pl); }
+            else if (PF.lightMode == kLightMIS) { float cl = fabsf(dot(ng0, d)); float pa = INST ? PF.matLightPdf[mid] : PF.triLightPdf[tri]; float pl = cl > 0.f ? PF.pTri * pa * hitT * hitT / cl : 0.f; w = misPower(lastPdf, pl); }
         }
         float3 c = T * M.emission * w; if (w > 0.f) { atomicAdd(&accum[pix].x, c.x); atomicAdd(&accum[pix].y, c.y); atomicAdd(&accum[pix].z, c.z); }
     }
@@ -279,8 +299,10 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
         if (us < PF.pSun) { l = sampleUniformCone(P.sunTo, P.sunCos, u2, u3); Le = P.sunE; pl = PF.pSun; isSun = true; ok = true; }
         else if (us < PF.pSun + PF.pTri) {
             float ut = fminf((us - PF.pSun) / PF.pTri, 0.99999994f);
-            int e = cdfFind(PF.emCdf, PF.nEm, ut); int kt = PF.emTri[e];
-            float4 a0 = tris[3 * kt], a1 = tris[3 * kt + 1], a2 = tris[3 * kt + 2];
+            int e = cdfFind(PF.emCdf, PF.nEm, ut);
+            float4 a0, a1, a2; int kt;
+            if (INST) { a0 = PF.emTris[3 * e]; a1 = PF.emTris[3 * e + 1]; a2 = PF.emTris[3 * e + 2]; kt = __float_as_int(a0.w); }
+            else { kt = PF.emTri[e]; a0 = tris[3 * kt]; a1 = tris[3 * kt + 1]; a2 = tris[3 * kt + 2]; }
             float su = sqrtf(u2); float3 pL = xyz(a0) + xyz(a1) * (su * (1.f - u3)) + xyz(a2) * (su * u3);
             float3 nL = normalize(cross(xyz(a1), xyz(a2)));
             // connect from the shadow ray's actual (offset) origin so that tmax stops just short of the light point
@@ -289,7 +311,8 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
             if (dist > 0.f) {
                 l = dv * (1.f / dist); float cl = fabsf(dot(nL, l));
                 if (cl > 0.f) {
-                    int lm = __float_as_int(a1.w); pl = PF.pTri * PF.triLightPdf[kt] * dist2 / cl; Le = PF.mats[lm].emission; tmax = dist * (1.f - 1e-3f); ok = true;
+                    int lm = __float_as_int(a1.w); float pa = INST ? PF.matLightPdf[lm] : PF.triLightPdf[kt];
+                    pl = PF.pTri * pa * dist2 / cl; Le = PF.mats[lm].emission; tmax = dist * (1.f - 1e-3f); ok = true;
                     if (PF.mtex && lm < PF.nMtex && PF.mtex[lm].emission >= 0) Le = Le * xyz(texRGBA(PF.mtex[lm].emission, triUV(kt, su * (1.f - u3), su * u3)));
                 }
             }
@@ -332,6 +355,101 @@ __global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restri
     int s = atomicAdd(qOutCnt, 1); qOut[s] = i;
 }
 
+#define SHADE_ARGS tris, nrm, pO, pD, pT, pDepth, pAux, accum, qOut, qOutCnt, sO, sD, sC, sCnt, smpBase, N
+#define SHADE_PARAMS const float4* __restrict__ tris, const float4* __restrict__ nrm, float4* pO, float4* pD, float4* pT, int* pDepth, float* pAux, float4* accum, \
+        int* qOut, int* qOutCnt, float4* sO, float4* sD, float4* sC, int* sCnt, int smpBase, int N
+// Every full-integrator kernel takes its queue length either from the host (nPtr == nullptr: nArg, grid sized to it)
+// or from device memory (nPtr: CUDA graphs / device-driven passes, fixed grid with a grid-stride loop).
+#define GRID_STRIDE(k, n) for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < (n); k += gridDim.x * blockDim.x)
+
+// fused closest-hit traversal + shading (default)
+template <int V, int TRI, bool INST>
+__global__ void __launch_bounds__(128) k_trace_shade_full(const float4* __restrict__ nodes, const float4* __restrict__ trav_, const int* __restrict__ q, const int* nPtr, int nArg, SHADE_PARAMS) {
+    const int n = nPtr ? *nPtr : nArg;
+    GRID_STRIDE(k, n) {
+        int i = q[k];
+        float4 O = pO[i], D = pD[i]; float hitT = D.w; int tri = -1, hinst = -1; float hu = 0, hv = 0;
+        sceneTrav<V, false, TRI, INST>(nodes, trav_, xyz(O), xyz(D), O.w, hitT, tri, hu, hv, hinst);
+        shadeFull<INST>(i, O, D, hitT, tri, hu, hv, hinst, SHADE_ARGS);
+    }
+}
+// split mode: closest-hit traversal into the hit buffer, then shading
+template <int V, int TRI, bool INST>
+__global__ void __launch_bounds__(128) k_trace_full(const float4* __restrict__ nodes, const float4* __restrict__ trav_, const int* __restrict__ q, const int* nPtr, int nArg, const float4* __restrict__ pO, const float4* __restrict__ pD, float4* hits, int* hitI) {
+    const int n = nPtr ? *nPtr : nArg;
+    GRID_STRIDE(k, n) {
+        int i = q[k];
+        float4 O = pO[i], D = pD[i]; float hitT = D.w; int tri = -1, hinst = -1; float hu = 0, hv = 0;
+        sceneTrav<V, false, TRI, INST>(nodes, trav_, xyz(O), xyz(D), O.w, hitT, tri, hu, hv, hinst);
+        hits[i] = make_float4(hitT, hu, hv, __int_as_float(tri)); if (INST) hitI[i] = hinst;
+    }
+}
+template <bool INST>
+__global__ void __launch_bounds__(128) k_shade_full(const int* __restrict__ q, const int* nPtr, int nArg, const float4* __restrict__ hits, const int* __restrict__ hitI, SHADE_PARAMS) {
+    const int n = nPtr ? *nPtr : nArg;
+    GRID_STRIDE(k, n) { int i = q[k]; float4 h = hits[i]; shadeFull<INST>(i, pO[i], pD[i], h.x, __float_as_int(h.w), h.y, h.z, INST ? hitI[i] : -1, SHADE_ARGS); }
+}
+template <int V, int TRI, bool INST>
+__global__ void __launch_bounds__(128) k_shadow_full(const float4* __restrict__ nodes, const float4* __restrict__ trav_, const int* nPtr, int nArg, const float4* __restrict__ sO, const float4* __restrict__ sD, const float4* __restrict__ sC, float4* accum) {
+    const int n = nPtr ? *nPtr : nArg;
+    GRID_STRIDE(k, n) {
+        float4 O = sO[k], D = sD[k]; float hitT = D.w; int tri = -1, hinst = -1; float u, v;
+        if (!sceneTrav<V, true, TRI, INST>(nodes, trav_, xyz(O), xyz(D), O.w, hitT, tri, u, v, hinst)) { float4 c = sC[k]; int pix = __float_as_int(c.w); atomicAdd(&accum[pix].x, c.x); atomicAdd(&accum[pix].y, c.y); atomicAdd(&accum[pix].z, c.z); }
+    }
+}
+// Persistent threads with dynamic ray fetching (Aila & Laine 2009): a grid that just fills the device; each warp keeps
+// traversing until >= kPtFetch of its lanes are idle, then those lanes take the next rays from the queue with one
+// atomicAdd per warp. ANY = shadow rays (queue index = ray index, contribution added when unoccluded).
+template <int V, int TRI, bool INST, bool ANY>
+__device__ __forceinline__ void persistentTrace(const float4* __restrict__ nodes, const float4* __restrict__ trav_, const int* __restrict__ q, int n, int* fetch,
+                                                const float4* __restrict__ rO, const float4* __restrict__ rD, float4* hits, int* hitI, const float4* __restrict__ sC, float4* accum) {
+    StepTrav<V, ANY, TRI, INST> st;
+    const int lane = threadIdx.x & 31; const unsigned lt = (1u << lane) - 1u;
+    int k = -1; bool live = true;
+    while (true) {
+        bool need = live && k < 0;
+        unsigned nm = __ballot_sync(FULLMASK, need);
+        if (nm) {
+            int leader = __ffs(nm) - 1, base = 0;
+            if (lane == leader) base = atomicAdd(fetch, __popc(nm));
+            base = __shfl_sync(FULLMASK, base, leader);
+            if (need) {
+                int kk = base + __popc(nm & lt);
+                if (kk < n) { k = kk; int i = ANY ? k : q[k]; float4 O = rO[i], D = rD[i]; st.init(xyz(O), xyz(D), O.w, D.w, INST ? PF.tlasRoot : 0); }
+                else live = false;
+            }
+        }
+        if (!__any_sync(FULLMASK, k >= 0)) break;
+        while (true) {
+            bool act = k >= 0;
+            if (act && st.step(PF.tlas, PF.inst, nodes, trav_)) {
+                if (ANY) { if (st.hitTri < 0) { float4 c = sC[k]; int pix = __float_as_int(c.w); atomicAdd(&accum[pix].x, c.x); atomicAdd(&accum[pix].y, c.y); atomicAdd(&accum[pix].z, c.z); } }
+                else { int i = q[k]; hits[i] = make_float4(st.hitT, st.hu, st.hv, __int_as_float(st.hitTri)); if (INST) hitI[i] = st.hitInst; }
+                k = -1; act = false;
+            }
+            unsigned idle = __ballot_sync(FULLMASK, !act && live);
+            if (__popc(idle) >= kPtFetch || !__any_sync(FULLMASK, act)) break;
+        }
+    }
+}
+template <int V, int TRI, bool INST>
+__global__ void __launch_bounds__(128) k_trace_full_pt(const float4* __restrict__ nodes, const float4* __restrict__ trav_, const int* __restrict__ q, const int* nPtr, int nArg, int* fetch, const float4* __restrict__ pO, const float4* __restrict__ pD, float4* hits, int* hitI) {
+    persistentTrace<V, TRI, INST, false>(nodes, trav_, q, nPtr ? *nPtr : nArg, fetch, pO, pD, hits, hitI, nullptr, nullptr);
+}
+template <int V, int TRI, bool INST>
+__global__ void __launch_bounds__(128) k_shadow_full_pt(const float4* __restrict__ nodes, const float4* __restrict__ trav_, const int* nPtr, int nArg, int* fetch, const float4* __restrict__ sO, const float4* __restrict__ sD, const float4* __restrict__ sC, float4* accum) {
+    persistentTrace<V, TRI, INST, true>(nodes, trav_, nullptr, nPtr ? *nPtr : nArg, fetch, sO, sD, nullptr, nullptr, sC, accum);
+}
+__global__ void k_setcount(int* c, int v) { if (threadIdx.x == 0) *c = v; }
+// TLAS input: world boxes of the instances (BLAS root box corners through the forward matrix)
+__global__ void k_inst_boxes(const DevInstance* __restrict__ inst, const float4* __restrict__ meshBox, int n, float4* lo, float4* hi) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    const DevInstance& I = inst[i]; float4 bl = meshBox[2 * I.mesh], bh = meshBox[2 * I.mesh + 1];
+    float3 mn = mk3(3.4e38f, 3.4e38f, 3.4e38f), mx = mk3(-3.4e38f, -3.4e38f, -3.4e38f);
+    for (int c = 0; c < 8; c++) { float3 w = xfRowsP(I.fwd, mk3(c & 1 ? bh.x : bl.x, c & 2 ? bh.y : bl.y, c & 4 ? bh.z : bl.z)); mn = vmin(mn, w); mx = vmax(mx, w); }
+    lo[i] = mk4(mn, 0.f); hi[i] = mk4(mx, 0.f);
+}
+
 // ---------------- host driver ----------------
 static const int TB = 128;
 // dispatch helpers (V, TRI runtime -> template)
@@ -343,11 +461,15 @@ static const int TB = 128;
         if (V_ == 2) { if (TRI_) F<2, 1, FS><<<G, T>>>ARGS; else F<2, 0, FS><<<G, T>>>ARGS; } \
         else if (V_ == 4) { if (TRI_) F<4, 1, FS><<<G, T>>>ARGS; else F<4, 0, FS><<<G, T>>>ARGS; } \
         else { if (TRI_) F<8, 1, FS><<<G, T>>>ARGS; else F<8, 0, FS><<<G, T>>>ARGS; } } while (0)
+// full integrator: V in {2, 8} x TRI x INST on stream st_ (V = 4 only for the fused kernel without instances)
+#define DISPF_V(F, VV, G, ARGS) do { if (INST_) { if (TRI_) F<VV, 1, true><<<G, TB, 0, st_>>>ARGS; else F<VV, 0, true><<<G, TB, 0, st_>>>ARGS; } \
+                                     else { if (TRI_) F<VV, 1, false><<<G, TB, 0, st_>>>ARGS; else F<VV, 0, false><<<G, TB, 0, st_>>>ARGS; } } while (0)
+#define DISPF(F, G, ARGS) do { if (V_ == 2) DISPF_V(F, 2, G, ARGS); else DISPF_V(F, 8, G, ARGS); } while (0)
 
 void WavefrontRenderer::init(const Params& H, const SceneBuffers& S, const RenderOptions& O) {
     O_ = O; if (O_.sort) O_.devloop = 1;
-    V_ = O.variant; TRI_ = O.tri;
-    int dev = 0; CK(cudaSetDevice(dev)); cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, dev)); gpuName = prop.name;
+    V_ = O.variant; TRI_ = O.tri; INST_ = O.inst ? 1 : 0;
+    int dev = 0; CK(cudaSetDevice(dev)); cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, dev)); gpuName = prop.name; nSM_ = prop.multiProcessorCount;
     size_t memFree0, memTot; CK(cudaMemGetInfo(&memFree0, &memTot));
     CK(cudaMalloc(&dNodes, S.nodes.size() * 16)); CK(cudaMemcpy(dNodes, S.nodes.data(), S.nodes.size() * 16, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dTris, S.tris.size() * 16)); CK(cudaMemcpy(dTris, S.tris.data(), S.tris.size() * 16, cudaMemcpyHostToDevice));
@@ -373,7 +495,7 @@ void WavefrontRenderer::init(const Params& H, const SceneBuffers& S, const Rende
         if (V_ == 2) { if (TRI_) OCC(2, 1); else OCC(2, 0); } else if (V_ == 4) { if (TRI_) OCC(4, 1); else OCC(4, 0); } else { if (TRI_) OCC(8, 1); else OCC(8, 0); }
 #undef OCC
         ptBlocks = bpm * prop.multiProcessorCount;
-        fprintf(stderr, "trace kernel: %d blocks/SM x %d SMs (occupancy %.0f%%)\n", bpm, prop.multiProcessorCount, 100.0 * bpm * 128 / prop.maxThreadsPerMultiProcessor);
+        if (!O_.full) fprintf(stderr, "trace kernel: %d blocks/SM x %d SMs (occupancy %.0f%%)\n", bpm, prop.multiProcessorCount, 100.0 * bpm * 128 / prop.maxThreadsPerMultiProcessor);
     }
     if (O_.full) initFull(S);
     CK(cudaEventCreate(&f0)); CK(cudaEventCreate(&f1));
@@ -381,10 +503,29 @@ void WavefrontRenderer::init(const Params& H, const SceneBuffers& S, const Rende
 
 template <typename T> static T* upload(const std::vector<T>& v) { if (v.empty()) return nullptr; T* d; CK(cudaMalloc(&d, v.size() * sizeof(T))); CK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); return d; }
 
+template <int V, int TRI, bool INST> static int occFull(bool shadow) {
+    int b = 0;
+    if (shadow) CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, k_shadow_full_pt<V, TRI, INST>, TB, 0));
+    else CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, k_trace_full_pt<V, TRI, INST>, TB, 0));
+    return b;
+}
+
 void WavefrontRenderer::initFull(const SceneBuffers& S) {
     size_t f0m, f1m, tm; CK(cudaMemGetInfo(&f0m, &tm));
+    CK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
     FullParams F; memset(&F, 0, sizeof F);
     F.mats = upload(S.mats); F.triLightPdf = upload(S.triLightPdf); F.emTri = upload(S.emTri); F.emCdf = upload(S.emCdf); F.nEm = (int)S.emTri.size();
+    if (INST_) {   // instanced scene: TLAS buffers (rebuilt by setInstances), per-frame emissive triangles
+        nInst_ = S.nInst;
+        CK(cudaMalloc(&dInst, (size_t)nInst_ * sizeof(DevInstance))); CK(cudaMalloc(&dTlas, (size_t)(nInst_ > 1 ? nInst_ - 1 : 1) * 64));
+        CK(cudaMalloc(&dBoxLo, (size_t)nInst_ * 16)); CK(cudaMalloc(&dBoxHi, (size_t)nInst_ * 16)); dMeshBox = upload(S.meshBox);
+        hploc_.reserve(nInst_);
+        F.inst = dInst; F.tlas = dTlas; F.tlasRoot = hplocBVH2Root(nInst_);
+        nEmInst_ = S.nEmInst; F.nEm = nEmInst_;
+        if (nEmInst_ > 0) { CK(cudaMalloc(&dEmTris, (size_t)nEmInst_ * 48)); CK(cudaMalloc(&dEmCdf, (size_t)(nEmInst_ + 1) * 4)); F.emTris = dEmTris; F.emCdf = dEmCdf; }
+        CK(cudaMalloc(&dMatLightPdf, S.mats.size() * 4)); CK(cudaMemset(dMatLightPdf, 0, S.mats.size() * 4)); F.matLightPdf = dMatLightPdf;
+        CK(cudaEventCreate(&tl0)); CK(cudaEventCreate(&tl1));
+    }
     F.hasEnv = S.env.w > 0 ? 1 : 0;
     if (F.hasEnv) { F.envTex = upload(S.env.texels); F.envMarg = upload(S.env.marg); F.envCond = upload(S.env.cond); F.envW = S.env.w; F.envH = S.env.h; F.envRot = S.envRotDeg * 3.14159265f / 180.f; }
     bool sun = S.sunOn, triL = F.nEm > 0 && O_.lightMode != kLightBSDF, envL = F.hasEnv && O_.lightMode != kLightBSDF;
@@ -407,16 +548,41 @@ void WavefrontRenderer::initFull(const SceneBuffers& S) {
     }
     CK(cudaMemcpyToSymbol(PF, &F, sizeof F));
     CK(cudaMalloc(&pAux, NK_ * 4));
+    if (INST_) CK(cudaMalloc(&hitI, NK_ * 4));
+    if (O_.persistent && V_ != 4) {
+        int bt = 0, bs = 0;
+        if (V_ == 2) { if (INST_) { bt = TRI_ ? occFull<2, 1, true>(false) : occFull<2, 0, true>(false); bs = TRI_ ? occFull<2, 1, true>(true) : occFull<2, 0, true>(true); }
+                       else { bt = TRI_ ? occFull<2, 1, false>(false) : occFull<2, 0, false>(false); bs = TRI_ ? occFull<2, 1, false>(true) : occFull<2, 0, false>(true); } }
+        else { if (INST_) { bt = TRI_ ? occFull<8, 1, true>(false) : occFull<8, 0, true>(false); bs = TRI_ ? occFull<8, 1, true>(true) : occFull<8, 0, true>(true); }
+               else { bt = TRI_ ? occFull<8, 1, false>(false) : occFull<8, 0, false>(false); bs = TRI_ ? occFull<8, 1, false>(true) : occFull<8, 0, false>(true); } }
+        ptTraceBlocks_ = bt * nSM_; ptShadowBlocks_ = bs * nSM_; ptBlocks = ptTraceBlocks_;
+        fprintf(stderr, "persistent traversal: trace %d blocks/SM, shadow %d blocks/SM x %d SMs\n", bt, bs, nSM_);
+    }
+    gridCap_ = 16 * nSM_;
     CK(cudaMemGetInfo(&f1m, &tm)); vramMB += (double)(f0m - f1m) / 1048576.0;
-    fprintf(stderr, "full integrator: %zu materials, %d emissive triangles, env %dx%d (%s sampling), light selection sun %.2f tri %.2f env %.2f, mode %s, rr %d, glossy-diffuse energy compensation %d, %zu textures\n",
+    fprintf(stderr, "full integrator: %zu materials, %d emissive triangles, env %dx%d (%s sampling), light selection sun %.2f tri %.2f env %.2f, mode %s, rr %d, glossy-diffuse energy compensation %d, %zu textures%s, kernels %s%s\n",
             S.mats.size(), F.nEm, F.envW, F.envH, O_.envUniform ? "uniform" : "importance", F.pSun, F.pTri, F.pEnv,
-            O_.lightMode == kLightMIS ? "mis" : O_.lightMode == kLightNEE ? "nee" : "bsdf", O_.rr, O_.gdEnergy, S.mtex.empty() ? (size_t)0 : S.tex.size());
+            O_.lightMode == kLightMIS ? "mis" : O_.lightMode == kLightNEE ? "nee" : "bsdf", O_.rr, O_.gdEnergy, S.mtex.empty() ? (size_t)0 : S.tex.size(),
+            INST_ ? ", instanced (TLAS/BLAS)" : "", O_.persistent ? "split+persistent" : O_.fuse ? "fused" : "split", O_.graph ? " + CUDA graph" : "");
+}
+
+// per-frame instance update: transforms, emissive triangles, TLAS rebuilt on the GPU (instance boxes -> H-PLOC -> BVH2)
+void WavefrontRenderer::setInstances(const std::vector<DevInstance>& inst, const std::vector<float4>& emTris, const std::vector<float>& emCdf, const std::vector<float>& matLightPdf) {
+    CK(cudaMemcpyAsync(dInst, inst.data(), inst.size() * sizeof(DevInstance), cudaMemcpyHostToDevice, st_));
+    if (nEmInst_ > 0) { CK(cudaMemcpyAsync(dEmTris, emTris.data(), emTris.size() * 16, cudaMemcpyHostToDevice, st_)); CK(cudaMemcpyAsync(dEmCdf, emCdf.data(), emCdf.size() * 4, cudaMemcpyHostToDevice, st_)); }
+    if (!matLightPdf.empty()) CK(cudaMemcpyAsync(dMatLightPdf, matLightPdf.data(), matLightPdf.size() * 4, cudaMemcpyHostToDevice, st_));
+    CK(cudaEventRecord(tl0, st_));
+    k_inst_boxes<<<(nInst_ + 127) / 128, 128, 0, st_>>>(dInst, dMeshBox, nInst_, dBoxLo, dBoxHi);
+    hploc_.build(dBoxLo, dBoxHi, nInst_, st_);
+    hplocToBVH2(hploc_.nodes, nInst_, dTlas, st_);
+    CK(cudaEventRecord(tl1, st_)); CK(cudaEventSynchronize(tl1));
+    float ms; CK(cudaEventElapsedTime(&ms, tl0, tl1)); tlasMs = ms;
+    CK(cudaGetLastError());
 }
 
 void WavefrontRenderer::launchTrace(int* q, int n) {
     if (n <= 0) return;
     const int N = N_;
-    if (O_.full) { int g = (n + TB - 1) / TB; DISPATCH(k_trace_shade_full, g, TB, (dNodes, dTrav, q, n, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut_, cnt, sO, sD, sC, cnt + 1, smp_, N)); return; }
     if (O_.fuse == 1) { int g = (n + TB - 1) / TB; DISPATCH3(k_trace_shade, false, g, TB, (dNodes, dTrav, q, n, dTris, dNrm, dAlb, pO, pD, pT, pDepth, accum, qOut_, cnt, sO, sD, sC, cnt + 1, smp_, N)); return; }
     if (O_.fuse == 2) { int g = (n + TB - 1) / TB; DISPATCH3(k_trace_shade, true, g, TB, (dNodes, dTrav, q, n, dTris, dNrm, dAlb, pO, pD, pT, pDepth, accum, qOut_, cnt, sO, sD, sC, cnt + 1, smp_, N)); return; }
     if (O_.persistent) { int g = ptBlocks < (n + 31) / 32 ? ptBlocks : (n + 31) / 32; CK(cudaMemsetAsync(cnt + 2, 0, 4)); DISPATCH(k_trace_dev, g, TB, (dNodes, dTrav, q, cnt + 8 * DEPTHS_, cnt + 2, pO, pD, hits)); }
@@ -429,16 +595,98 @@ void WavefrontRenderer::launchShadow(int n) {
     else { int g = (n + TB - 1) / TB; DISPATCH(k_shadow, g, TB, (dNodes, dTrav, n, sO, sD, sC, accum)); }
 }
 
+// full integrator, one bounce: closest-hit traversal + shading of queue (q, n | *nPtr) -> continuation queue qOut
+// (count *qOutCnt) and shadow queue (count *sCnt); fetch = zeroed counter for the persistent kernel
+void WavefrontRenderer::launchFullTrace(int* q, const int* nPtr, int n, int* qOut, int* qOutCnt, int* sCnt, int* fetch, int smp) {
+    const int N = N_;
+    const int gq = nPtr ? gridCap_ : (n + TB - 1) / TB;
+    if (O_.persistent) {
+        int g = nPtr ? ptTraceBlocks_ : std::min(ptTraceBlocks_, (n + 31) / 32);
+        DISPF(k_trace_full_pt, g, (dNodes, dTrav, q, nPtr, n, fetch, pO, pD, hits, hitI));
+        if (INST_) k_shade_full<true><<<gq, TB, 0, st_>>>(q, nPtr, n, hits, hitI, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut, qOutCnt, sO, sD, sC, sCnt, smp, N);
+        else k_shade_full<false><<<gq, TB, 0, st_>>>(q, nPtr, n, hits, hitI, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut, qOutCnt, sO, sD, sC, sCnt, smp, N);
+    } else if (O_.fuse == 0) {
+        DISPF(k_trace_full, gq, (dNodes, dTrav, q, nPtr, n, pO, pD, hits, hitI));
+        if (INST_) k_shade_full<true><<<gq, TB, 0, st_>>>(q, nPtr, n, hits, hitI, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut, qOutCnt, sO, sD, sC, sCnt, smp, N);
+        else k_shade_full<false><<<gq, TB, 0, st_>>>(q, nPtr, n, hits, hitI, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut, qOutCnt, sO, sD, sC, sCnt, smp, N);
+    } else if (V_ == 4) {
+        if (TRI_) k_trace_shade_full<4, 1, false><<<gq, TB, 0, st_>>>(dNodes, dTrav, q, nPtr, n, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut, qOutCnt, sO, sD, sC, sCnt, smp, N);
+        else k_trace_shade_full<4, 0, false><<<gq, TB, 0, st_>>>(dNodes, dTrav, q, nPtr, n, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut, qOutCnt, sO, sD, sC, sCnt, smp, N);
+    } else DISPF(k_trace_shade_full, gq, (dNodes, dTrav, q, nPtr, n, dTris, dNrm, pO, pD, pT, pDepth, pAux, accum, qOut, qOutCnt, sO, sD, sC, sCnt, smp, N));
+}
+void WavefrontRenderer::launchFullShadow(const int* nPtr, int n, int* fetch) {
+    if (O_.persistent) { int g = nPtr ? ptShadowBlocks_ : std::min(ptShadowBlocks_, (n + 31) / 32); DISPF(k_shadow_full_pt, g, (dNodes, dTrav, nPtr, n, fetch, sO, sD, sC, accum)); return; }
+    const int g = nPtr ? gridCap_ : (n + TB - 1) / TB;
+    if (V_ == 4) { if (TRI_) k_shadow_full<4, 1, false><<<g, TB, 0, st_>>>(dNodes, dTrav, nPtr, n, sO, sD, sC, accum); else k_shadow_full<4, 0, false><<<g, TB, 0, st_>>>(dNodes, dTrav, nPtr, n, sO, sD, sC, accum); return; }
+    DISPF(k_shadow_full, g, (dNodes, dTrav, nPtr, n, sO, sD, sC, accum));
+}
+// device-driven passes (no host readback): queue counts live in cnt + 8 * depth ([0] queue, [1] shadow queue,
+// [2] / [3] persistent fetch counters, [8] = next depth's queue); every bounce is launched with a fixed grid.
+// This is the sequence captured into the CUDA graph.
+void WavefrontRenderer::enqueueFullPasses(int spp) {
+    const int K = K_, DEPTHS = DEPTHS_; const size_t NK = NK_;
+    for (int s = 0; s < spp; s += K) {
+        k_raygen<<<(int)((NK + 255) / 256), 256, 0, st_>>>(pO, pD, pT, pDepth, q0, s, K);
+        CK(cudaMemsetAsync(pAux, 0, NK * 4, st_));
+        CK(cudaMemsetAsync(cnt, 0, (DEPTHS + 1) * 8 * 4, st_));
+        k_setcount<<<1, 32, 0, st_>>>(cnt, (int)NK);
+        int* qIn = q0; int* qOut = q1;
+        for (int depth = 0; depth < DEPTHS; depth++) {
+            int* c = cnt + depth * 8;
+            launchFullTrace(qIn, c, 0, qOut, c + 8, c + 1, c + 2, s);
+            launchFullShadow(c + 1, 0, c + 3);
+            int* t = qIn; qIn = qOut; qOut = t;
+        }
+        k_sumcounts<<<1, 32, 0, st_>>>(cnt, DEPTHS, dtot);
+    }
+}
+
+void WavefrontRenderer::renderFull(int spp, FrameStats& S) {
+    const int N = N_, K = K_, DEPTHS = DEPTHS_; const size_t NK = NK_;
+    CK(cudaMemsetAsync(accum, 0, (size_t)N * 16, st_)); CK(cudaMemsetAsync(dtot, 0, 16, st_)); evUsed = 0;
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> pairs;
+    CK(cudaEventRecord(f0, st_));
+    if (O_.graph) {
+        if (!gexec_ || gSpp_ != spp) {
+            if (gexec_) CK(cudaGraphExecDestroy(gexec_));
+            cudaGraph_t g; CK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal)); enqueueFullPasses(spp); CK(cudaStreamEndCapture(st_, &g));
+            CK(cudaGraphInstantiate(&gexec_, g, 0)); size_t nn = 0; CK(cudaGraphGetNodes(g, nullptr, &nn)); CK(cudaGraphDestroy(g)); gSpp_ = spp;
+            fprintf(stderr, "CUDA graph: %zu nodes for %d spp (%d passes x %d bounces)\n", nn, spp, (spp + K - 1) / K, DEPTHS);
+        }
+        CK(cudaGraphLaunch(gexec_, st_));
+    } else {
+        for (int s = 0; s < spp; s += K) {
+            k_raygen<<<(int)((NK + 255) / 256), 256, 0, st_>>>(pO, pD, pT, pDepth, q0, s, K);
+            CK(cudaMemsetAsync(pAux, 0, NK * 4, st_));
+            int* qIn = q0; int* qOut = q1; int n = (int)NK;
+            for (int depth = 0; depth < DEPTHS && n > 0; depth++) {
+                CK(cudaMemsetAsync(cnt, 0, 16, st_));
+                cudaEvent_t a = nextEvent(), b = nextEvent(); CK(cudaEventRecord(a, st_)); launchFullTrace(qIn, nullptr, n, qOut, cnt, cnt + 1, cnt + 2, s); CK(cudaEventRecord(b, st_)); pairs.push_back({ a, b });
+                S.rays += n;
+                CK(cudaMemcpyAsync(hcnt, cnt, 8, cudaMemcpyDeviceToHost, st_)); CK(cudaStreamSynchronize(st_));
+                int nNext = hcnt[0], nSh = hcnt[1];
+                if (nSh > 0) { cudaEvent_t c = nextEvent(), d = nextEvent(); CK(cudaEventRecord(c, st_)); launchFullShadow(nullptr, nSh, cnt + 3); CK(cudaEventRecord(d, st_)); pairs.push_back({ c, d }); S.shadowRays += nSh; }
+                int* t = qIn; qIn = qOut; qOut = t; n = nNext;
+            }
+        }
+    }
+    CK(cudaEventRecord(f1, st_)); CK(cudaEventSynchronize(f1));
+    float ms; CK(cudaEventElapsedTime(&ms, f0, f1)); S.frameMs = ms;
+    if (O_.graph) { S.traceMs = ms; unsigned long long tot[2]; CK(cudaMemcpy(tot, dtot, 16, cudaMemcpyDeviceToHost)); S.rays = (double)tot[0]; S.shadowRays = (double)tot[1]; }
+    else for (auto& pr : pairs) { CK(cudaEventElapsedTime(&ms, pr.first, pr.second)); S.traceMs += ms; }
+    CK(cudaGetLastError());
+}
+
 cudaEvent_t WavefrontRenderer::nextEvent() { if (evUsed == evs.size()) { cudaEvent_t e; CK(cudaEventCreate(&e)); evs.push_back(e); } return evs[evUsed++]; }
 
 void WavefrontRenderer::render(int spp, FrameStats& S) {
+    if (O_.full) { renderFull(spp, S); return; }
     const int N = N_, K = K_, DEPTHS = DEPTHS_; const size_t NK = NK_;
     CK(cudaMemset(accum, 0, N * 16)); CK(cudaMemset(dtot, 0, 16)); evUsed = 0;
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> pairs;
     CK(cudaEventRecord(f0));
     for (int s = 0; s < spp; s += K) {
         k_raygen<<<(int)((NK + 255) / 256), 256>>>(pO, pD, pT, pDepth, q0, s, K);
-        if (O_.full) CK(cudaMemsetAsync(pAux, 0, NK * 4));
         int* qIn = q0; int* qOut = q1; int* qS = q2; int n = (int)NK;
         if (!O_.devloop) {
             for (int depth = 0; depth < DEPTHS && n > 0; depth++) {
@@ -448,11 +696,11 @@ void WavefrontRenderer::render(int spp, FrameStats& S) {
                 qOut_ = qOut; smp_ = s;
                 cudaEvent_t a = nextEvent(), b = nextEvent(); CK(cudaEventRecord(a)); launchTrace(qIn, n); CK(cudaEventRecord(b)); pairs.push_back({ a, b });
                 S.rays += n;
-                if (!O_.fuse && !O_.full)
+                if (!O_.fuse)
                     k_shade<<<(n + 127) / 128, 128>>>(qIn, n, hits, dTris, dNrm, dAlb, pO, pD, pT, pDepth, accum, qOut, cnt, sO, sD, sC, cnt + 1, nullptr, s, N);
                 CK(cudaMemcpyAsync(hcnt, cnt, 8, cudaMemcpyDeviceToHost)); CK(cudaStreamSynchronize(0));
                 int nNext = hcnt[0], nSh = hcnt[1];
-                if (O_.fuse == 2 && !O_.full) S.shadowRays += nSh;
+                if (O_.fuse == 2) S.shadowRays += nSh;
                 else if (nSh > 0) {
                     if (O_.persistent) { hNK[1] = nSh; CK(cudaMemcpyAsync(cnt + 8 * DEPTHS + 1, hNK + 1, 4, cudaMemcpyHostToDevice)); }
                     cudaEvent_t c = nextEvent(), d = nextEvent(); CK(cudaEventRecord(c)); launchShadow(nSh); CK(cudaEventRecord(d)); pairs.push_back({ c, d }); S.shadowRays += nSh;
