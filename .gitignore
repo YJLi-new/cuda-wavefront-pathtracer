@@ -1,0 +1,6 @@
+build/
+out/
+logs/
+*.pfm
+*.exr
+__pycache__/

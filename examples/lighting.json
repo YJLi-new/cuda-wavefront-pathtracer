@@ -1,0 +1,14 @@
+{
+  "sun_dir_to_light_world_zup": [
+    0.608749,
+    -0.42625,
+    0.669131
+  ],
+  "sun_irradiance_W_m2": 3.0,
+  "sun_angle_rad": 0.00918,
+  "sky_radiance_rgb_linear": [
+    0.3,
+    0.38,
+    0.5
+  ]
+}

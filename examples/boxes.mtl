@@ -1,0 +1,18 @@
+newmtl ground
+Kd 0.500 0.500 0.500
+
+newmtl terracotta
+Kd 0.800 0.350 0.220
+
+newmtl sage
+Kd 0.350 0.600 0.400
+
+newmtl cobalt
+Kd 0.220 0.320 0.800
+
+newmtl ivory
+Kd 0.850 0.820 0.750
+
+newmtl ochre
+Kd 0.800 0.620 0.200
+
